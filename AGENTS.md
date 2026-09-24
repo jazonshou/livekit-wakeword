@@ -55,7 +55,7 @@ Raw audio (16kHz) → MelSpectrogramFrontend (ONNX) → SpeechEmbedding (ONNX) �
   - `generate.py` — Synthetic clip orchestration (`run_generate`); default TTS via `tts/` backends (`tts_backend` in config)
   - `tts/` — `SpeechSynthesizer` protocol, `get_tts_backend()`, `PiperVitsBackend`, `VoxCpmBackend`
   - `piper/` — Piper-style VITS: `generate_samples` (904-speaker SLERP), `vits/` model, `vits_utils.py`, `defaults.py` (checkpoint paths/URLs), `text.py` (CMUDict phrase prep)
-  - `augment.py` — `AudioAugmentor` (EQ, distortion, RIR, background mixing) for all 6 splits; positives aligned to END of window, negatives/backgrounds center-padded
+  - `augment.py` — `AudioAugmentor` (EQ, distortion, RIR, background mixing) for all 6 splits; on round 0, positives and negatives are both end-aligned (backgrounds center-padded) *before* RIR + noise, so noise covers the padding
   - `dataset.py` — `WakeWordDataset` (memory-mapped .npy, mixed-class batch generator)
   - `features.py` — Extract features through ONNX pipeline → .npy files
 - **`training/`**

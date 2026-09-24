@@ -79,8 +79,14 @@ class AudioAugmentor:
         self,
         audio: np.ndarray,
         snr_db_range: tuple[float, float] = (5.0, 15.0),
+        signal_power: float | None = None,
     ) -> np.ndarray:
-        """Mix audio with random background noise at given SNR."""
+        """Mix audio with random background noise at given SNR.
+
+        The noise spans the whole of *audio*. The SNR is relative to *signal_power*
+        when given (e.g. the power of just the speech in a padded clip), otherwise to
+        the power of the whole array.
+        """
         if not self.background_files:
             return audio
         import soundfile as sf
@@ -99,7 +105,7 @@ class AudioAugmentor:
 
         # Compute SNR mixing
         snr_db = random.uniform(*snr_db_range)
-        audio_power = np.mean(audio**2) + 1e-8
+        audio_power = (np.mean(audio**2) if signal_power is None else signal_power) + 1e-8
         bg_power = np.mean(bg**2) + 1e-8
         scale = np.sqrt(audio_power / (bg_power * 10 ** (snr_db / 10)))
         mixed = audio + scale * bg
@@ -113,15 +119,36 @@ def align_clip_to_end(
 ) -> np.ndarray:
     """Align a clip to the END of the target window with random jitter.
 
-    Positive clips are placed at the end of the window with 0-200ms jitter.
+    Positive and negative clips are both placed at the end of the window with 0-200ms
+    jitter; clips longer than the window keep their end.
     """
+    return _align_clip_to_end(audio, target_length, jitter_samples)[0]
+
+
+def _align_clip_to_end(
+    audio: np.ndarray,
+    target_length: int,
+    jitter_samples: int = 3200,
+) -> tuple[np.ndarray, int, int]:
+    """:func:`align_clip_to_end`, also returning the ``[start, end)`` span the clip fills."""
     result = np.zeros(target_length, dtype=np.float32)
     jitter = random.randint(0, jitter_samples)
     end_pos = target_length - jitter
     start_pos = max(0, end_pos - len(audio))
     clip_start = max(0, len(audio) - (end_pos - start_pos))
     result[start_pos:end_pos] = audio[clip_start : clip_start + (end_pos - start_pos)]
-    return result
+    return result, start_pos, end_pos
+
+
+def _pad_or_crop_center(audio: np.ndarray, target_length: int) -> np.ndarray:
+    """Center-pad (with zeros) or center-crop a clip to ``target_length``."""
+    if len(audio) < target_length:
+        padded = np.zeros(target_length, dtype=np.float32)
+        start = (target_length - len(audio)) // 2
+        padded[start : start + len(audio)] = audio
+        return padded
+    start = (len(audio) - target_length) // 2
+    return audio[start : start + target_length]
 
 
 _ALL_SPLITS = [
@@ -156,6 +183,11 @@ def run_augment(config: WakeWordConfig) -> None:
         background_paths=[Path(p) for p in config.augmentation.background_paths],
         rir_paths=[Path(p) for p in config.augmentation.rir_paths],
     )
+    if not augmentor.background_files:
+        logger.warning(
+            f"No background noise found in {config.augmentation.background_paths}; "
+            "clip padding will stay digital silence, which live audio never contains"
+        )
 
     for round_idx in range(config.augmentation.rounds):
         logger.info(f"Augmentation round {round_idx + 1}/{config.augmentation.rounds}")
@@ -167,7 +199,9 @@ def run_augment(config: WakeWordConfig) -> None:
             _augment_directory(
                 clip_dir,
                 augmentor,
-                is_positive="positive" in split,
+                # Positives and negatives are aligned identically, so the phrase's
+                # position can't give its class away.
+                end_align=not split.startswith("background"),
                 round_idx=round_idx,
                 target_duration_s=target_duration,
             )
@@ -176,7 +210,7 @@ def run_augment(config: WakeWordConfig) -> None:
 def _augment_directory(
     clip_dir: Path,
     augmentor: AudioAugmentor,
-    is_positive: bool,
+    end_align: bool,
     target_duration_s: float = 2.0,
     sample_rate: int = 16000,
     round_idx: int = 0,
@@ -188,6 +222,14 @@ def _augment_directory(
     augmentation compounds (stacks) progressively.  Every round
     writes to its own file (``clip_000000_r0.wav``, ``_r1.wav``, …)
     so the originals are always preserved.
+
+    On round 0, speech clips (``end_align``: positives and negatives alike) are
+    end-aligned with jitter and background clips are center-padded/cropped. This
+    happens *before* RIR and background mixing, so reverb tails stay inside the
+    window and the noise covers the padding. Otherwise the classifier can learn
+    where the digital silence sits instead of how the phrase sounds. A streaming
+    listener slides every phrase through the end of its window, so that shortcut
+    makes near-miss phrases fire.
     """
     import re
 
@@ -211,30 +253,27 @@ def _augment_directory(
             audio = audio[:, 0]
         audio = audio.astype(np.float32)
 
-        # Apply per-sample augmentations
+        # Apply per-sample augmentations (to the unpadded clip on round 0)
         audio = augmentor.augment_clip(audio)
+
+        # Align to target duration only on round 0 (raw TTS clips vary in
+        # length).  Later rounds already have the correct duration.
+        # [start, end) is the span the SNR is measured over.
+        start, end = 0, target_length
+        if round_idx == 0:
+            if end_align:
+                audio, start, end = _align_clip_to_end(audio, target_length)
+            else:
+                audio = _pad_or_crop_center(audio, target_length)
 
         # Apply RIR
         audio = augmentor.apply_rir(audio)
 
-        # Mix with background
-        audio = augmentor.mix_with_background(audio)
-
-        # Align to target duration only on round 0 (raw TTS clips vary in
-        # length).  Later rounds already have the correct duration.
-        if round_idx == 0:
-            if is_positive:
-                audio = align_clip_to_end(audio, target_length)
-            else:
-                # Center-pad or crop negatives
-                if len(audio) < target_length:
-                    padded = np.zeros(target_length, dtype=np.float32)
-                    start = (target_length - len(audio)) // 2
-                    padded[start : start + len(audio)] = audio
-                    audio = padded
-                elif len(audio) > target_length:
-                    start = (len(audio) - target_length) // 2
-                    audio = audio[start : start + target_length]
+        # Mix with background across the whole window. Measure the SNR against the
+        # clip's own span: counting the padding would make the noise too quiet.
+        audio = augmentor.mix_with_background(
+            audio, signal_power=float(np.mean(audio[start:end] ** 2))
+        )
 
         # Derive output name from the original stem (strip any _rN suffix)
         orig_stem = re.sub(r"_r\d+$", "", wav_path.stem)
