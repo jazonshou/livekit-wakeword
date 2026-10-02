@@ -23,24 +23,34 @@ from livekit.wakeword.inference.listener import (
 
 
 class FakeModel:
-    """Mock WakeWordModel that returns pre-configured scores.
+    """Mock StreamingWakeWordModel that returns pre-configured scores.
 
-    With the stateless model, predict() receives a full ~2-second chunk.
-    The fake ignores the audio data and walks through a pre-configured
-    scores sequence by call index.
+    Like the real streaming model, process() scores nothing until
+    CHUNK_FRAMES frames have arrived since the last reset().  After that it
+    walks through a pre-configured scores sequence, one entry per frame;
+    ``_call_count`` counts scored frames.
     """
 
     def __init__(self, scores_sequence: list[dict[str, float]] | None = None):
         self._scores_sequence = scores_sequence or []
         self._call_count = 0
+        self._frames = 0
+        self.reset_count = 0
 
-    def predict(self, audio_chunk: np.ndarray) -> dict[str, float]:
+    def reset(self) -> None:
+        self._frames = 0
+        self.reset_count += 1
+
+    def process(self, audio: np.ndarray) -> list[dict[str, float]]:
+        self._frames += 1
+        if self._frames < CHUNK_FRAMES:
+            return []
         if self._call_count < len(self._scores_sequence):
             scores = self._scores_sequence[self._call_count]
         else:
             scores = {"test": 0.0}
         self._call_count += 1
-        return scores
+        return [scores]
 
 
 class FakeStream:
@@ -91,14 +101,14 @@ def _patch_pyaudio(stream: FakeStream):
 
 
 @pytest.mark.asyncio
-async def test_predict_runs_in_executor():
-    """predict() should execute on a non-main thread (in the executor)."""
+async def test_process_runs_in_executor():
+    """process() should execute on a non-main thread (in the executor)."""
     predict_threads: list[threading.Thread] = []
 
     class ThreadTrackingModel(FakeModel):
-        def predict(self, audio_chunk: np.ndarray) -> dict[str, float]:
+        def process(self, audio: np.ndarray) -> list[dict[str, float]]:
             predict_threads.append(threading.current_thread())
-            return super().predict(audio_chunk)
+            return super().process(audio)
 
     model = ThreadTrackingModel(scores_sequence=[{"test": 0.0}] * 50)
     stream = FakeStream()
@@ -110,7 +120,7 @@ async def test_predict_runs_in_executor():
     assert len(predict_threads) > 0
     main_thread = threading.main_thread()
     for t in predict_threads:
-        assert t is not main_thread, "predict() ran on the main thread"
+        assert t is not main_thread, "process() ran on the main thread"
 
 
 @pytest.mark.asyncio
@@ -118,7 +128,10 @@ async def test_error_propagation():
     """If the audio loop crashes, wait_for_detection raises RuntimeError."""
 
     class ErrorModel:
-        def predict(self, audio_chunk: np.ndarray) -> dict[str, float]:
+        def reset(self) -> None:
+            pass
+
+        def process(self, audio: np.ndarray) -> list[dict[str, float]]:
             raise ValueError("ONNX inference failed")
 
     model = ErrorModel()
@@ -145,7 +158,7 @@ async def test_stream_error_propagation():
 
 @pytest.mark.asyncio
 async def test_buffer_cleared_after_detection():
-    """Listener's frame buffer is cleared after each detection."""
+    """The streaming model's buffered audio is dropped after each detection."""
     # First predict call returns a high score → detection
     scores = [{"test": 0.9}]
     model = FakeModel(scores_sequence=scores)
@@ -158,13 +171,14 @@ async def test_buffer_cleared_after_detection():
             )
             assert detection.name == "test"
             assert detection.confidence == pytest.approx(0.9)
-            # Buffer should be empty after detection
-            assert len(listener._frame_buffer) == 0
+            # Stream should be reset after detection (once on enter, once here)
+            assert model.reset_count == 2
+            assert model._frames == 0
 
 
 @pytest.mark.asyncio
-async def test_predict_not_called_until_buffer_full():
-    """predict() is not called until CHUNK_FRAMES of audio have been read."""
+async def test_no_scores_until_buffer_full():
+    """No frame is scored until CHUNK_FRAMES of audio have been read."""
     model = FakeModel(scores_sequence=[{"test": 0.0}] * 100)
     # Error at frame CHUNK_FRAMES - 1 (before buffer would fill)
     stream = FakeStream(error_after=CHUNK_FRAMES - 1)
@@ -174,7 +188,7 @@ async def test_predict_not_called_until_buffer_full():
             with pytest.raises(RuntimeError, match="Audio loop crashed"):
                 await asyncio.wait_for(listener.wait_for_detection(), timeout=5.0)
 
-    # predict() should never have been called — buffer never filled
+    # Nothing should have been scored — buffer never filled
     assert model._call_count == 0
 
 
@@ -230,3 +244,56 @@ async def test_shutdown_during_active_listening():
         async with WakeWordListener(model, threshold=0.5) as listener:
             await asyncio.sleep(0.2)  # let loop run a few iterations
     # If we reach here without hanging, shutdown is clean.
+
+
+@pytest.mark.asyncio
+async def test_min_consecutive_requires_a_run_above_threshold():
+    """With min_consecutive=3, isolated high frames don't fire; a run of 3 does."""
+    high, low = {"test": 0.9}, {"test": 0.1}
+    scores = [high, high, low, high, low, high, high, {"test": 0.8}, high]
+    model = FakeModel(scores_sequence=scores)
+    stream = FakeStream()
+
+    with _patch_pyaudio(stream):
+        async with WakeWordListener(
+            model, threshold=0.5, debounce=0.0, min_consecutive=3
+        ) as listener:
+            detection = await asyncio.wait_for(listener.wait_for_detection(), timeout=5.0)
+
+    # Fires on the third frame of the run (index 7), reporting that frame's score
+    assert detection.confidence == pytest.approx(0.8)
+    assert model._call_count == 8
+
+
+@pytest.mark.asyncio
+async def test_min_consecutive_counts_each_model_separately():
+    """Alternating models above threshold never build a run."""
+    scores = [{"a": 0.9, "b": 0.1}, {"a": 0.1, "b": 0.9}] * 5 + [{"a": 0.9, "b": 0.1}] * 2
+    model = FakeModel(scores_sequence=scores)
+    stream = FakeStream()
+
+    with _patch_pyaudio(stream):
+        async with WakeWordListener(
+            model, threshold=0.5, debounce=0.0, min_consecutive=2
+        ) as listener:
+            detection = await asyncio.wait_for(listener.wait_for_detection(), timeout=5.0)
+
+    assert detection.name == "a"
+    assert model._call_count == len(scores)
+
+
+def test_min_consecutive_must_be_positive():
+    with pytest.raises(ValueError, match="min_consecutive"):
+        WakeWordListener(FakeModel(), min_consecutive=0)  # type: ignore[arg-type]
+
+
+def test_wraps_stateless_model_in_streaming_model():
+    from livekit.wakeword import StreamingWakeWordModel, WakeWordModel
+
+    model = WakeWordModel()
+    listener = WakeWordListener(model)
+    assert isinstance(listener._model, StreamingWakeWordModel)
+    assert listener._model.model is model
+
+    stream = StreamingWakeWordModel(model)
+    assert WakeWordListener(stream)._model is stream

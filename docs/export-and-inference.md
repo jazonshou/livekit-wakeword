@@ -76,7 +76,7 @@ Use `dnn` for openWakeWord-compatible TFLite; deploy `conv_attention`/`rnn` via 
 
 ## Inference API
 
-**Source:** `src/livekit/wakeword/inference/model.py`, `src/livekit/wakeword/inference/listener.py`
+**Source:** `src/livekit/wakeword/inference/model.py`, `src/livekit/wakeword/inference/streaming.py`, `src/livekit/wakeword/inference/listener.py`
 
 ### WakeWordModel
 
@@ -115,9 +115,33 @@ Feature extraction models (`melspectrogram.onnx`, `embedding_model.onnx`) are bu
 - **Chunk size:** ~2 seconds (32,000 samples) recommended — yields 16 embeddings for the classifier
 - **Stateless:** No internal audio buffering; the caller manages the audio window
 
+### StreamingWakeWordModel
+
+For a continuous stream, `StreamingWakeWordModel` wraps a `WakeWordModel` and scores every 80 ms hop incrementally. It computes the mel frames of each new hop and one new speech embedding, and keeps the last 16 embeddings, so each hop costs one embedding-model call instead of the 16 that `predict()` makes on a 2 s window (about 5 ms instead of 40 ms per hop on an x86 core).
+
+```python
+from livekit.wakeword import StreamingWakeWordModel, WakeWordModel
+
+stream = StreamingWakeWordModel(WakeWordModel(models=["hey_livekit.onnx"]))
+
+for frame in frames:                 # 16 kHz int16 or float32, any length
+    for scores in stream.process(frame):   # one dict per completed 80 ms hop
+        if scores["hey_livekit"] >= 0.5:
+            ...
+
+stream.reset()                       # drop buffered audio, e.g. after a detection
+```
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `process(audio)` | `list[dict[str, float]]` | Scores for each 80 ms hop the audio completes; empty during the first 2 s after construction or `reset()` |
+| `reset()` | `None` | Drop buffered audio and cached features |
+
+At every hop the scores equal `predict()` on the most recent 2 s of audio, up to float rounding (`tests/test_streaming.py` checks this on every hop). The mel model floors quiet frames at 80 dB below the loudest frame in its input, so when the loudest frame in the 2 s window changes, cached embeddings that touched the floor are recomputed. With a live microphone's noise floor this rarely happens. Several streams can share one `WakeWordModel` and its ONNX sessions.
+
 ### WakeWordListener
 
-The `WakeWordListener` class provides async microphone detection with debouncing.
+The `WakeWordListener` class provides async microphone detection with debouncing. It feeds each 80 ms microphone frame to a `StreamingWakeWordModel`.
 
 ```python
 import asyncio
@@ -138,9 +162,10 @@ asyncio.run(main())
 
 ```python
 WakeWordListener(
-    model: WakeWordModel,    # WakeWordModel instance with loaded classifiers
+    model: WakeWordModel | StreamingWakeWordModel,  # loaded classifiers
     threshold: float = 0.5,  # Detection threshold (0-1)
-    debounce: float = 2.0    # Minimum seconds between detections
+    debounce: float = 2.0,   # Minimum seconds between detections
+    min_consecutive: int = 1 # 80 ms frames in a row a score must reach threshold to fire
 )
 ```
 

@@ -6,12 +6,12 @@ import asyncio
 import concurrent.futures
 import logging
 import time
-from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
 
 from .model import WakeWordModel
+from .streaming import StreamingWakeWordModel
 
 logger = logging.getLogger(__name__)
 
@@ -34,10 +34,11 @@ class Detection:
 class WakeWordListener:
     """Async wake word listener that handles audio capture.
 
-    The listener owns the audio buffer and passes fixed ~2-second chunks
-    to the stateless ``WakeWordModel.predict()``.  After a detection the
-    loop pauses automatically and resumes when the consumer calls
-    ``wait_for_detection()`` again.
+    Each 80 ms microphone frame goes to a ``StreamingWakeWordModel``, which
+    scores the most recent 2 s of audio with one new embedding per frame.
+    Scoring starts once 2 s of audio have been captured.  After a detection
+    the loop pauses automatically, drops the buffered audio, and resumes when
+    the consumer calls ``wait_for_detection()`` again.
 
     Example:
         from livekit.wakeword import WakeWordModel, WakeWordListener
@@ -52,20 +53,32 @@ class WakeWordListener:
 
     def __init__(
         self,
-        model: WakeWordModel,
+        model: WakeWordModel | StreamingWakeWordModel,
         threshold: float = 0.5,
         debounce: float = 2.0,
+        min_consecutive: int = 1,
     ):
         """Initialize listener.
 
         Args:
-            model: WakeWordModel instance with loaded classifiers.
+            model: WakeWordModel instance with loaded classifiers, or a
+                StreamingWakeWordModel wrapping one.
             threshold: Detection threshold (0-1).
             debounce: Minimum seconds between detections.
+            min_consecutive: Number of consecutive 80 ms frames a model's
+                score must stay at or above ``threshold`` before it fires.
+                The default of 1 fires on the first frame above threshold.
         """
+        if min_consecutive < 1:
+            raise ValueError(f"min_consecutive must be >= 1, got {min_consecutive}")
+        if isinstance(model, WakeWordModel):
+            model = StreamingWakeWordModel(model)
         self._model = model
         self._threshold = threshold
         self._debounce = debounce
+        self._min_consecutive = min_consecutive
+        # Consecutive frames each model has scored at or above threshold
+        self._consecutive: dict[str, int] = {}
 
         self._stream = None
         self._pa = None
@@ -77,7 +90,7 @@ class WakeWordListener:
         # Error propagation: stored exception from _audio_loop crash
         self._error: BaseException | None = None
 
-        # Single-thread executor keeps predict() off the event loop
+        # Single-thread executor keeps inference off the event loop
         self._executor: concurrent.futures.ThreadPoolExecutor | None = None
 
         # Pause/resume control: cleared after detection, set when consumer
@@ -87,9 +100,6 @@ class WakeWordListener:
         # Signals when _audio_loop exits (success or crash) so
         # wait_for_detection() can raise instead of hanging forever.
         self._done_event = asyncio.Event()
-
-        # Sliding window of recent audio frames (listener owns the buffer)
-        self._frame_buffer: deque[np.ndarray] = deque(maxlen=CHUNK_FRAMES)
 
     async def __aenter__(self) -> WakeWordListener:
         """Start audio capture."""
@@ -107,7 +117,8 @@ class WakeWordListener:
         self._listening.set()
         self._done_event.clear()
         self._error = None
-        self._frame_buffer.clear()
+        self._model.reset()
+        self._consecutive.clear()
         self._detection_queue = asyncio.Queue()
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self._task = asyncio.create_task(self._audio_loop())
@@ -165,41 +176,28 @@ class WakeWordListener:
                     break
 
                 frame = np.frombuffer(data, dtype=np.int16)
-                self._frame_buffer.append(frame)
 
-                # Wait until the buffer has enough audio for the model
-                if len(self._frame_buffer) < CHUNK_FRAMES:
-                    continue
-
-                # Build the audio chunk and run inference in executor
-                chunk = np.concatenate(list(self._frame_buffer))
-                scores = await loop.run_in_executor(
+                # Score the new frame in the executor (empty while warming up)
+                hop_scores = await loop.run_in_executor(
                     self._executor,
-                    self._model.predict,
-                    chunk,
+                    self._model.process,
+                    frame,
                 )
                 if not self._running:
                     break
 
                 # Check for detections (lightweight, fine on event loop)
-                now = time.monotonic()
-                for name, score in scores.items():
-                    if score >= self._threshold:
-                        if now - self._last_detection_time >= self._debounce:
-                            self._last_detection_time = now
-
-                            # Pause the loop and clear the buffer so no stale
-                            # audio is processed while the consumer handles
-                            # the detection.
-                            self._listening.clear()
-                            self._frame_buffer.clear()
-
-                            await self._detection_queue.put(
-                                Detection(
-                                    name=name, confidence=score, timestamp=now
-                                )
-                            )
-                            break  # one detection per iteration
+                for scores in hop_scores:
+                    detection = self._check_scores(scores)
+                    if detection is not None:
+                        # Pause the loop and drop buffered audio so no stale
+                        # audio is processed while the consumer handles the
+                        # detection.
+                        self._listening.clear()
+                        self._model.reset()
+                        self._consecutive.clear()
+                        await self._detection_queue.put(detection)
+                        break  # one detection per iteration
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -207,6 +205,22 @@ class WakeWordListener:
             self._error = exc
         finally:
             self._done_event.set()
+
+    def _check_scores(self, scores: dict[str, float]) -> Detection | None:
+        """Update consecutive counts with one frame's scores; return a detection if one fires."""
+        now = time.monotonic()
+        detection = None
+        for name, score in scores.items():
+            count = self._consecutive.get(name, 0) + 1 if score >= self._threshold else 0
+            self._consecutive[name] = count
+            if (
+                detection is None
+                and count >= self._min_consecutive
+                and now - self._last_detection_time >= self._debounce
+            ):
+                self._last_detection_time = now
+                detection = Detection(name=name, confidence=score, timestamp=now)
+        return detection
 
     async def wait_for_detection(self) -> Detection:
         """Wait for and return the next wake word detection.
