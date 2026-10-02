@@ -21,6 +21,7 @@ from ..data.dataset import create_dataloader
 from ..models.pipeline import WakeWordClassifier
 from ..utils import get_device
 from .metrics import evaluate_model, find_best_threshold
+from .validation import ValidationData, debounce_hops, load_validation_data, score_stream
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +97,7 @@ class WakeWordTrainer:
         self._metrics_log: list[dict[str, object]] = []
         self._metrics_path = config.model_output_dir / f"{config.model_name}_metrics.json"
         self._train_start: float = 0.0
+        self._validation_data: ValidationData | None = None
 
     def _build_dataloader(self) -> torch.utils.data.DataLoader:  # type: ignore[type-arg]
         model_dir = self.config.model_output_dir
@@ -141,38 +143,16 @@ class WakeWordTrainer:
             label_funcs={k: v for k, v in label_funcs.items() if k in data_files},
         )
 
-    def _load_validation_data(self) -> tuple[np.ndarray, np.ndarray]:
-        """Load test features for validation."""
-        model_dir = self.config.model_output_dir
-        pos_path = model_dir / "positive_features_test.npy"
-        neg_path = model_dir / "negative_features_test.npy"
-
-        pos = np.load(str(pos_path)) if pos_path.exists() else np.zeros((0, 16, 96))
-        neg = np.load(str(neg_path)) if neg_path.exists() else np.zeros((0, 16, 96))
-
-        # Also load background noise test features if available
-        bg_test_path = model_dir / "background_noise_features_test.npy"
-        if bg_test_path.exists():
-            bg_neg = np.load(str(bg_test_path))
-            neg = np.concatenate([neg, bg_neg], axis=0) if neg.shape[0] > 0 else bg_neg
-
-        # Also load validation features if available
-        val_path = self.config.data_path / "features" / "validation_set_features.npy"
-        if val_path.exists():
-            val_neg = np.load(str(val_path))
-            # Reshape 2D (N, 96) → 3D (N//16, 16, 96) if needed
-            if val_neg.ndim == 2:
-                n_full = (val_neg.shape[0] // 16) * 16
-                remainder = val_neg.shape[0] - n_full
-                if remainder > 0:
-                    logger.warning(
-                        "Dropping %d/%d validation samples (not divisible by 16)",
-                        remainder, val_neg.shape[0],
-                    )
-                val_neg = val_neg[:n_full].reshape(-1, 16, 96)
-            neg = np.concatenate([neg, val_neg], axis=0) if neg.shape[0] > 0 else val_neg
-
-        return pos, neg
+    def _load_validation_data(self) -> ValidationData:
+        """Load validation clips and stream once; they don't change during training."""
+        if self._validation_data is None:
+            self._validation_data = load_validation_data(self.config)
+            v = self._validation_data
+            logger.info(
+                "Validation: %d positive clips, %d negative clips, %.1f h negative stream",
+                v.positive.shape[0], v.negative_clips.shape[0], v.stream_hours,
+            )
+        return self._validation_data
 
     @torch.no_grad()
     def _predict(self, features: np.ndarray, batch_size: int = 512) -> np.ndarray:
@@ -185,19 +165,34 @@ class WakeWordTrainer:
             all_preds.append(preds)
         return np.concatenate(all_preds, axis=0).squeeze(-1)
 
+    def _validation_scores(self) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+        """Scores for positive clips, negative clips and every hop of the negative stream."""
+        data = self._load_validation_data()
+        if data.positive.shape[0] == 0:
+            return None
+        pos_preds = self._predict(data.positive)
+        neg_preds = (
+            self._predict(data.negative_clips)
+            if data.negative_clips.shape[0]
+            else np.zeros(0, dtype=np.float32)
+        )
+        stream_preds = score_stream(self._predict, data.stream)
+        return pos_preds, neg_preds, stream_preds
+
     def _validate(self) -> dict[str, float]:
         """Run validation and return metrics."""
-        pos_features, neg_features = self._load_validation_data()
-        if pos_features.shape[0] == 0:
+        scores = self._validation_scores()
+        if scores is None:
             return {"fpph": 0.0, "recall": 0.0, "accuracy": 0.0, "threshold": 0.5}
-        pos_preds = self._predict(pos_features)
-        neg_preds = self._predict(neg_features) if neg_features.shape[0] > 0 else np.array([])
-
-        # Compute actual validation hours from clip count × clip duration
-        clip_duration = self.config.augmentation.clip_duration
-        validation_hours = neg_features.shape[0] * clip_duration / 3600.0
+        pos_preds, neg_preds, stream_preds = scores
         return evaluate_model(
-            pos_preds, neg_preds, threshold=0.5, validation_hours=validation_hours,
+            pos_preds,
+            neg_preds,
+            threshold=0.5,
+            validation_hours=self._load_validation_data().clip_hours,
+            stream_preds=stream_preds,
+            debounce_hops=debounce_hops(self.config),
+            min_consecutive=self.config.streaming_eval.min_consecutive,
         )
 
     def _log_metrics(self, step: int, phase: int, metrics: dict[str, float]) -> None:
@@ -388,18 +383,18 @@ class WakeWordTrainer:
 
     def _find_optimal_threshold(self) -> dict[str, float]:
         """Find best detection threshold on validation data."""
-        pos_features, neg_features = self._load_validation_data()
-        if pos_features.shape[0] == 0:
+        scores = self._validation_scores()
+        if scores is None:
             return {"fpph": 0.0, "recall": 0.0, "accuracy": 0.0, "threshold": 0.5}
-        pos_preds = self._predict(pos_features)
-        neg_preds = self._predict(neg_features) if neg_features.shape[0] > 0 else np.array([])
-
-        clip_duration = self.config.augmentation.clip_duration
-        validation_hours = neg_features.shape[0] * clip_duration / 3600.0
+        pos_preds, neg_preds, stream_preds = scores
         return find_best_threshold(
-            pos_preds, neg_preds,
-            validation_hours=validation_hours,
+            pos_preds,
+            neg_preds,
+            validation_hours=self._load_validation_data().clip_hours,
             target_fpph=self.config.target_fp_per_hour,
+            stream_preds=stream_preds,
+            debounce_hops=debounce_hops(self.config),
+            min_consecutive=self.config.streaming_eval.min_consecutive,
         )
 
     def _average_best_checkpoints(self) -> nn.Module:

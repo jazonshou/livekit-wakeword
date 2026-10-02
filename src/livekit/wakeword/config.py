@@ -111,6 +111,41 @@ class VoxCpmTtsConfig(BaseModel):
     )
 
 
+class StreamingEvalSet(BaseModel):
+    """A labelled set of clips (or long recordings) replayed as one audio stream."""
+
+    name: str
+    positive: bool
+    # WAV files, or directories searched recursively for *.wav
+    paths: list[str]
+    # Precede each clip with a speech clip that ends 0-400 ms before it
+    speech_before: bool = False
+
+
+class StreamingEvalConfig(BaseModel):
+    """Streaming evaluation (``eval --streaming``) and stream-level validation settings."""
+
+    # Detector behaviour, shared with training validation
+    debounce_seconds: float = 2.0
+    min_consecutive: int = 1
+    # Threshold selection: lowest miss rate with at most this many false accepts per hour
+    target_fa_per_hour: float = 0.5
+    # A detection counts as a hit up to this long after the clip ends
+    detection_window_seconds: float = 1.0
+    # Silence between consecutive clips in a stream
+    gap_seconds: float = 3.0
+    max_clips_per_set: int | None = 1000
+    # Derive positive_silence / positive_speech / near_miss sets from the test splits
+    default_sets: bool = True
+    sets: list[StreamingEvalSet] = Field(default_factory=list)
+    # Speech clips used for speech_before (default: negative_test clips)
+    speech_paths: list[str] = Field(default_factory=list)
+    # Optional noise bed mixed under every stream at snr_db (e.g. DEMAND)
+    background_paths: list[str] = Field(default_factory=list)
+    snr_db: float = 10.0
+    seed: int = 0
+
+
 class WakeWordConfig(BaseModel):
     """Top-level config for a wake word model."""
 
@@ -155,6 +190,7 @@ class WakeWordConfig(BaseModel):
     label_smoothing: float = 0.05
     max_negative_weight: float = 1500.0
     target_fp_per_hour: float = 0.2
+    streaming_eval: StreamingEvalConfig = Field(default_factory=StreamingEvalConfig)
     batch_n_per_class: dict[str, int] = Field(
         default_factory=lambda: {
             "positive": 50,
