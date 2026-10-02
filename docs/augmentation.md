@@ -10,20 +10,13 @@ The augmentation stage applies realistic audio transformations to synthetic TTS 
 ```
 Original TTS clips (clip_000000.wav)
     │
-    ▼  Round 0: reads originals
+    ▼  Every round N reads the originals
+    ├──► (positives) maybe swap in the split phrase with a pause
     ├──► Per-sample augmentations (EQ, distortion)
-    ├──► Alignment (fit to the window)
+    ├──► Placement: end of the window, maybe after context speech
     ├──► RIR convolution
     ├──► Background mixing (covers the whole window)
-    └──► clip_000000_r0.wav
-              │
-              ▼  Round 1: reads r0 output (stacks)
-              ├──► Per-sample augmentations
-              ├──► RIR convolution
-              ├──► Background mixing
-              └──► clip_000000_r1.wav
-                        │
-                        ▼  ... Round N reads r(N-1)
+    └──► clip_000000_rN.wav
 ```
 
 ## AudioAugmentor
@@ -72,13 +65,13 @@ output = audio + scale * background
 
 ## Clip Alignment
 
-On round 0, each clip is fitted to the target window (default 2.0 seconds = 32,000 samples) **before** RIR and background mixing.
+In every round, each clip is fitted to the target window (default 2.0 seconds = 32,000 samples) **before** RIR and background mixing.
 
 ### Positive and Negative Clips — End-Aligned
 
 `align_clip_to_end(audio, target_length, jitter_samples=3200)`
 
-Positive and negative clips are both placed at the **end** of the window with random jitter of up to 3200 samples (200ms at 16kHz). Clips longer than the window keep their end. This simulates the real detection scenario where the wake word appears at the trailing edge of the audio buffer.
+Positive and negative clips are both placed at the **end** of the window with random jitter of up to `augmentation.end_jitter` seconds (default 0.3 s; the function's own default is 200 ms). Clips longer than the window keep their end. This simulates the real detection scenario where the wake word appears at the trailing edge of the audio buffer.
 
 ```
 [    padding    |  phrase  | jitter ]
@@ -86,6 +79,24 @@ Positive and negative clips are both placed at the **end** of the window with ra
 ```
 
 The padding is zero only until background mixing, which then fills the whole window with noise.
+
+### Speech placement
+
+`SpeechPlacement` (built per split by `build_placement()`) can fill the padding with speech, so the model also sees the phrase right after talk, as a live stream does. All of it is off by default:
+
+| Field (`augmentation.`) | Effect |
+|-------|--------|
+| `context_speech_probability` | Chance that a `context_speech/` clip (see `n_context_samples`) fills the padding before a positive or negative clip |
+| `near_miss_context_probability` | Chance that a negative clip of the same split precedes a positive ("hey jack. hey computer"); checked first |
+| `context_gap` | Seconds between the end of the context and the phrase (default 0 to 0.4) |
+| `split_phrase_probability` | Chance that a positive is rebuilt from a `positive_*_parts/` pair (see `n_split_phrase_samples`), the halves joined by a pause |
+| `split_phrase_gap` | Seconds of pause between the halves (default 0.1 to 0.5) |
+
+Context is scaled to the phrase's level, minus 0 to 6 dB. The SNR is still measured over the phrase alone.
+
+```
+[ context speech | gap |  phrase  | jitter ]
+```
 
 ### Background Clips — Center-Padded
 
@@ -99,18 +110,19 @@ Live audio never contains digital silence, and `WakeWordListener` slides a 2 s w
 
 The augmentation pipeline runs `config.augmentation.rounds` passes over all six directories (positive train/test, negative train/test, background train/test). Each round writes to a separate file (`clip_000000_r0.wav`, `clip_000000_r1.wav`, etc.) — originals are never modified.
 
-Rounds **stack**: round 0 reads the clean TTS originals, round 1 reads round 0's output, round 2 reads round 1's output, and so on. This produces progressively more degraded audio as augmentation effects compound across rounds. Old augmented files (`_rN.wav`) are cleaned up at the start of each run so re-running is idempotent.
+Every round reads the clean TTS originals and draws a new placement, jitter, context, RIR and noise, so `rounds: 3` gives three independent variants of each clip. (Rounds used to stack, each reading the previous round's output, which kept the clip in the same position and piled up to three reverbs and three layers of noise.) Old augmented files (`_rN.wav`) are cleaned up at the start of each run so re-running is idempotent.
 
 ## Per-Clip Processing Order
 
 For each WAV file in a directory:
 
 1. Read audio, convert to float32, take first channel if stereo
-2. Apply per-sample augmentations (EQ, distortion)
-3. Align to window — round 0 only (end-aligned for positives and negatives, center-padded for background clips)
-4. Apply RIR convolution (50% probability)
-5. Mix with background noise across the whole window
-6. Write to `clip_NNNNNN_r{round}.wav` (originals preserved)
+2. Positives: maybe replace the clip with its split-phrase version
+3. Apply per-sample augmentations (EQ, distortion), to the context clip too
+4. Fit to the window: end-aligned (maybe after context speech) for positives and negatives, center-padded for background clips
+5. Apply RIR convolution (50% probability)
+6. Mix with background noise across the whole window
+7. Write to `clip_NNNNNN_r{round}.wav` (originals preserved)
 
 ## Output
 
@@ -121,7 +133,7 @@ output/<model_name>/
 ├── positive_train/
 │   ├── clip_000000.wav             # Original TTS (preserved, not used for training)
 │   ├── clip_000000_r0.wav          # Round 0 augmented
-│   ├── clip_000000_r1.wav          # Round 1 (stacked on r0)
+│   ├── clip_000000_r1.wav          # Round 1 (a fresh variant of the original)
 │   └── ...
 ├── positive_test/
 ├── negative_train/

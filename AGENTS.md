@@ -52,10 +52,11 @@ Raw audio (16kHz) → MelSpectrogramFrontend (ONNX) → SpeechEmbedding (ONNX) �
   - `classifier.py` — `DNNClassifier` (FC+LayerNorm), `RNNClassifier` (Bi-LSTM), `build_classifier()` factory
   - `pipeline.py` — `WakeWordClassifier` (training wrapper for classifier head)
 - **`data/`**
-  - `generate.py` — Synthetic clip orchestration (`run_generate`); default TTS via `tts/` backends (`tts_backend` in config)
-  - `tts/` — `SpeechSynthesizer` protocol, `get_tts_backend()`, `PiperVitsBackend`, `VoxCpmBackend`
+  - `generate.py` — Synthetic clip orchestration (`run_generate`); default TTS via `tts/` backends (`tts_backend` in config); negatives = phonetic neighbours (`phonetic_neighbours`) + word swaps + custom phrases, each with a fixed share; test splits use held-out phrases and voices
+  - `tts/` — `SpeechSynthesizer` protocol, `get_tts_backend()`, `PiperVitsBackend`, `VoxCpmBackend`, `split_voices()` (train/test voice split)
   - `piper/` — Piper-style VITS: `generate_samples` (904-speaker SLERP), `vits/` model, `vits_utils.py`, `defaults.py` (checkpoint paths/URLs), `text.py` (CMUDict phrase prep)
-  - `augment.py` — `AudioAugmentor` (EQ, distortion, RIR, background mixing) for all 6 splits; on round 0, positives and negatives are both end-aligned (backgrounds center-padded) *before* RIR + noise, so noise covers the padding
+  - `augment.py` — `AudioAugmentor` (EQ, distortion, RIR, background mixing) for all 6 splits; every round re-reads the original clips; positives and negatives are both end-aligned (backgrounds center-padded) *before* RIR + noise, so noise covers the padding; `SpeechPlacement` optionally adds context speech before the phrase and split-phrase pauses
+  - `wordlists.py` — built-in word-swap words and context sentences
   - `dataset.py` — `WakeWordDataset` (memory-mapped .npy, mixed-class batch generator)
   - `features.py` — Extract features through ONNX pipeline → .npy files
 - **`training/`**

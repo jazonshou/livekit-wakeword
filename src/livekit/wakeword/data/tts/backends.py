@@ -31,8 +31,16 @@ class SpeechSynthesizer(Protocol):
         *,
         start_index: int = 0,
         batch_size: int = 50,
+        holdout_voices: bool = False,
+        voice_group_size: int = 1,
     ) -> list[Path]:
-        """Write ``clip_%06d.wav`` at 16 kHz; honor *start_index* for resume."""
+        """Write ``clip_%06d.wav`` at 16 kHz; honor *start_index* for resume.
+
+        *holdout_voices* selects the voices reserved for test splits (disjoint from
+        the training voices). *voice_group_size* consecutive clips share one voice.
+        Clip ``i`` must get the same phrase (``phrases[i % len(phrases)]``) and voice
+        on every run, so resumed splits match.
+        """
         ...
 
 
