@@ -44,6 +44,23 @@ custom_negative_phrases:
   - "hey look at"
   - "hey look it"
 
+# Share of negative clips spent on custom_negative_phrases (the rest goes to
+# auto-generated phonetic near-misses and word swaps)
+custom_negative_share: 0.3
+
+# Share of negative clips that swap one word for a common word or name
+# ("hey there", "hey siri"). Suggestion: 0.2
+word_swap_share: 0.0
+
+# Generated negative phrases and TTS voices held out for the test splits only
+negative_test_holdout: 0.2
+test_voice_fraction: 0.1
+
+# Optional extra TTS splits used by augmentation (see augmentation: below)
+# n_context_samples: 5000          # generic sentences heard before the phrase
+# n_split_phrase_samples: 3000     # "hey" | "livekit" halves in one voice
+# n_split_phrase_samples_val: 500
+
 # ============================================================================
 # TTS Parameters (VITS + SLERP speaker blending)
 # ============================================================================
@@ -99,6 +116,20 @@ augmentation:
 
   # Room impulse response directories for reverb (downloaded via `setup`)
   rir_paths: [./data/rirs]
+
+  # Max seconds between the end of a clip and the end of the window
+  end_jitter: 0.3
+
+  # Speech before the phrase (needs n_context_samples) and near-misses
+  # before positives. Suggestion: 0.5 and 0.1
+  context_speech_probability: 0.0
+  near_miss_context_probability: 0.0
+  context_gap: [0.0, 0.4]
+
+  # Positives rebuilt as "hey ... livekit" with a pause (needs n_split_phrase_samples)
+  # Suggestion: 0.15
+  split_phrase_probability: 0.0
+  split_phrase_gap: [0.1, 0.5]
 
 # ============================================================================
 # Model Architecture
