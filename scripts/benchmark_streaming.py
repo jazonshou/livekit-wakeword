@@ -15,6 +15,7 @@ needs soundfile).
 from __future__ import annotations
 
 import argparse
+import importlib
 import os
 import platform
 import time
@@ -38,12 +39,11 @@ class _WindowScorer:
         self._model = model
         self._buf = np.zeros(0, dtype=np.int16)
 
-    def process_frame(self, frame: np.ndarray) -> dict[str, float]:
+    def process(self, frame: np.ndarray) -> list[dict[str, float]]:
         self._buf = np.concatenate([self._buf, frame])[-25 * FRAME_SAMPLES :]
         if self._buf.shape[0] < 25 * FRAME_SAMPLES:
-            return {}
-        scores: dict[str, float] = self._model.predict(self._buf)
-        return scores
+            return []
+        return [self._model.predict(self._buf)]
 
 
 def _load_audio(wav: Path | None, seconds: float) -> np.ndarray:
@@ -78,16 +78,17 @@ def main() -> None:
     opts.inter_op_num_threads = 1
     opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
 
-    streaming_cls = getattr(inference_model, "StreamingWakeWordModel", None)
-    scorer: Any
-    if args.scorer == "streaming" and streaming_cls is not None:
-        scorer = streaming_cls(models=[args.model], sess_options=opts)
-        used = "streaming"
-    else:
-        if args.scorer == "streaming":
+    model = inference_model.WakeWordModel([args.model], sess_options=opts)
+    scorer: Any = _WindowScorer(model)
+    used = "window"
+    if args.scorer == "streaming":
+        try:
+            streaming = importlib.import_module("livekit.wakeword.inference.streaming")
+        except ImportError:
             print("StreamingWakeWordModel not available; falling back to --scorer window")
-        scorer = _WindowScorer(inference_model.WakeWordModel([args.model], sess_options=opts))
-        used = "window"
+        else:
+            scorer = streaming.StreamingWakeWordModel(model)
+            used = "streaming"
 
     audio = _load_audio(args.wav, args.seconds)
     n_hops = audio.shape[0] // FRAME_SAMPLES
@@ -102,7 +103,7 @@ def main() -> None:
             cpu_start = time.process_time()
             wall_start = time.perf_counter()
         t0 = time.perf_counter()
-        scorer.process_frame(audio[i * FRAME_SAMPLES : (i + 1) * FRAME_SAMPLES])
+        scorer.process(audio[i * FRAME_SAMPLES : (i + 1) * FRAME_SAMPLES])
         wall[i] = (time.perf_counter() - t0) * 1000
     cpu_s = time.process_time() - cpu_start
     wall_s = time.perf_counter() - wall_start

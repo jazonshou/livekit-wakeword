@@ -77,6 +77,20 @@ class WindowScorer:
         return scores
 
 
+class StreamingScorer:
+    """Adapts ``StreamingWakeWordModel.process()`` to one score dict per frame."""
+
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+
+    def reset(self) -> None:
+        self._stream.reset()
+
+    def process_frame(self, frame: np.ndarray) -> dict[str, float]:
+        hops: list[dict[str, float]] = self._stream.process(frame)
+        return hops[-1] if hops else {}
+
+
 def make_scorer(model_path: str | Path, kind: str = "streaming") -> tuple[FrameScorer, str]:
     """Build a frame scorer for one classifier.
 
@@ -84,21 +98,26 @@ def make_scorer(model_path: str | Path, kind: str = "streaming") -> tuple[FrameS
         model_path: ONNX classifier.
         kind: ``"streaming"`` for ``StreamingWakeWordModel`` (cached embeddings, the
             path a live device runs) or ``"window"`` for ``predict()`` on a sliding
-            2 s window.
+            2 s window. Both give the same scores; streaming is much faster.
 
     Returns:
         (scorer, kind actually used)
     """
-    from ..inference import model as inference_model
+    import importlib
+
+    from ..inference.model import WakeWordModel
 
     if kind not in ("streaming", "window"):
         raise ValueError(f"Unknown scorer {kind!r}; expected 'streaming' or 'window'")
+    model = WakeWordModel(models=[model_path])
     if kind == "streaming":
-        streaming_cls = getattr(inference_model, "StreamingWakeWordModel", None)
-        if streaming_cls is not None:
-            return streaming_cls(models=[model_path]), "streaming"
-        logger.warning("StreamingWakeWordModel not available; using the sliding-window scorer")
-    return WindowScorer(inference_model.WakeWordModel(models=[model_path])), "window"
+        try:
+            module = importlib.import_module("livekit.wakeword.inference.streaming")
+        except ImportError:
+            logger.warning("StreamingWakeWordModel not available; using the sliding-window scorer")
+        else:
+            return StreamingScorer(module.StreamingWakeWordModel(model)), "streaming"
+    return WindowScorer(model), "window"
 
 
 @dataclass
