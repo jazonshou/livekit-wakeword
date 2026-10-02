@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Any
 
 import typer
 from rich.logging import RichHandler
@@ -339,6 +340,19 @@ def eval(
     model_path: str = typer.Option(
         None, "--model", "-m", help="Path to ONNX model (default: <output_dir>/<model_name>.onnx)"
     ),
+    streaming: bool = typer.Option(
+        False,
+        "--streaming",
+        help="Replay audio streams in 80 ms hops and report miss rate / false accepts per set",
+    ),
+    scorer: str = typer.Option(
+        "streaming",
+        "--scorer",
+        help="With --streaming: 'streaming' (cached embeddings) or 'window' (2 s predict())",
+    ),
+    threshold: float | None = typer.Option(
+        None, "--threshold", "-t", help="With --streaming: report sets at this threshold"
+    ),
 ) -> None:
     """Evaluate model on validation set: DET curve, AUT, FPPH, recall."""
     from pathlib import Path
@@ -352,6 +366,15 @@ def eval(
 
     logger.info(f"Evaluating '{config.model_name}' with model {resolved_model}...")
 
+    if streaming:
+        from .eval.streaming import run_streaming_eval
+
+        report = run_streaming_eval(config, resolved_model, scorer=scorer, threshold=threshold)
+        _print_streaming_report(report)
+        json_path = config.model_output_dir / f"{config.model_name}_streaming_eval.json"
+        logger.info(f"Streaming eval: {json_path}")
+        return
+
     from .eval.evaluate import run_eval
 
     results = run_eval(config, resolved_model)
@@ -361,6 +384,34 @@ def eval(
         f"Recall={results['recall']:.1%}  Threshold={results['threshold']:.2f}"
     )
     logger.info(f"DET curve: {config.model_output_dir / f'{config.model_name}_det.png'}")
+
+
+def _print_streaming_report(report: dict[str, Any]) -> None:
+    from rich.console import Console
+    from rich.table import Table
+
+    sel = report["selected"]
+    met = "" if report["target_met"] else " (target not met)"
+    table = Table(
+        title=(
+            f"{report['model']} — {report['scorer']} scorer, threshold "
+            f"{report['report_threshold']:.2f} (selected {sel['threshold']:.2f}: miss "
+            f"{sel['miss_rate']:.1%} at {sel['fa_per_hour']:.2f} FA/h{met})"
+        )
+    )
+    for col in ("Set", "Clips", "Hours", "Miss rate", "Fired on clips", "False accepts", "FA/h"):
+        table.add_column(col, justify="left" if col == "Set" else "right")
+    for name, s in report["sets"].items():
+        table.add_row(
+            name,
+            str(s["clips"]),
+            f"{s['hours']:.2f}",
+            f"{s['miss_rate']:.1%}" if s["positive"] else "",
+            "" if s["positive"] else f"{s['fa_per_clip']:.1%}",
+            str(s["false_accepts"]),
+            "" if s["positive"] else f"{s['fa_per_hour']:.2f}",
+        )
+    Console().print(table)
 
 
 @app.command()
