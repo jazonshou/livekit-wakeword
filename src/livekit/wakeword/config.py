@@ -58,6 +58,40 @@ class AugmentationConfig(BaseModel):
     rounds: int = 1
     background_paths: list[str] = Field(default_factory=lambda: ["./data/backgrounds"])
     rir_paths: list[str] = Field(default_factory=lambda: ["./data/rirs"])
+    end_jitter: float = Field(
+        default=0.3,
+        ge=0.0,
+        description="Max seconds between the end of a speech clip and the end of the window",
+    )
+    context_speech_probability: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="Chance that other speech (the context_speech split) fills the padding "
+        "before a positive or adversarial clip; needs n_context_samples > 0",
+    )
+    near_miss_context_probability: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="Chance that an adversarial clip precedes a positive clip "
+        "(e.g. 'hey jack. hey computer'); checked before context_speech_probability",
+    )
+    context_gap: tuple[float, float] = Field(
+        default=(0.0, 0.4),
+        description="Range of seconds of gap between the context clip and the phrase",
+    )
+    split_phrase_probability: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="Chance that a positive clip is replaced by the two halves of the phrase "
+        "(positive_*_parts splits) joined with a pause; needs n_split_phrase_samples > 0",
+    )
+    split_phrase_gap: tuple[float, float] = Field(
+        default=(0.1, 0.5),
+        description="Range of seconds of pause between the halves of a split phrase",
+    )
 
 
 class ModelConfig(BaseModel):
@@ -111,6 +145,41 @@ class VoxCpmTtsConfig(BaseModel):
     )
 
 
+class StreamingEvalSet(BaseModel):
+    """A labelled set of clips (or long recordings) replayed as one audio stream."""
+
+    name: str
+    positive: bool
+    # WAV files, or directories searched recursively for *.wav
+    paths: list[str]
+    # Precede each clip with a speech clip that ends 0-400 ms before it
+    speech_before: bool = False
+
+
+class StreamingEvalConfig(BaseModel):
+    """Streaming evaluation (``eval --streaming``) and stream-level validation settings."""
+
+    # Detector behaviour, shared with training validation
+    debounce_seconds: float = 2.0
+    min_consecutive: int = 1
+    # Threshold selection: lowest miss rate with at most this many false accepts per hour
+    target_fa_per_hour: float = 0.5
+    # A detection counts as a hit up to this long after the clip ends
+    detection_window_seconds: float = 1.0
+    # Silence between consecutive clips in a stream
+    gap_seconds: float = 3.0
+    max_clips_per_set: int | None = 1000
+    # Derive positive_silence / positive_speech / near_miss sets from the test splits
+    default_sets: bool = True
+    sets: list[StreamingEvalSet] = Field(default_factory=list)
+    # Speech clips used for speech_before (default: negative_test clips)
+    speech_paths: list[str] = Field(default_factory=list)
+    # Optional noise bed mixed under every stream at snr_db (e.g. DEMAND)
+    background_paths: list[str] = Field(default_factory=list)
+    snr_db: float = 10.0
+    seed: int = 0
+
+
 class WakeWordConfig(BaseModel):
     """Top-level config for a wake word model."""
 
@@ -127,6 +196,52 @@ class WakeWordConfig(BaseModel):
     piper_tts: PiperTtsConfig = Field(default_factory=PiperTtsConfig)
     voxcpm_tts: VoxCpmTtsConfig = Field(default_factory=VoxCpmTtsConfig)
     custom_negative_phrases: list[str] = Field(default_factory=list)
+
+    # Negative phrase mix and voices
+    seed: int = Field(default=0, description="Seed for phrase lists, voices and splits")
+    custom_negative_share: float = Field(
+        default=0.3,
+        ge=0.0,
+        le=1.0,
+        description="Share of negative clips spent on custom_negative_phrases (when set)",
+    )
+    word_swap_share: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+        description="Share of negative clips that swap one word of the wake phrase for a "
+        "common word or name (e.g. 'hey there', 'hey siri')",
+    )
+    word_swap_words: list[str] | None = Field(
+        default=None,
+        description="Words for word_swap_share (None = built-in list of common words/names)",
+    )
+    negative_test_holdout: float = Field(
+        default=0.2,
+        ge=0.0,
+        lt=1.0,
+        description="Share of generated negative phrases kept out of negative_train and used "
+        "only for negative_test",
+    )
+    test_voice_fraction: float = Field(
+        default=0.1,
+        ge=0.0,
+        lt=1.0,
+        description="Share of TTS voices held out from training and used for the test splits",
+    )
+    n_context_samples: int = Field(
+        default=0,
+        ge=0,
+        description="Clips of generic speech (context_speech split) used as speech before "
+        "the phrase during augmentation",
+    )
+    n_split_phrase_samples: int = Field(
+        default=0,
+        ge=0,
+        description="Positive phrases synthesized as two halves in one voice "
+        "(positive_train_parts), joined with a pause during augmentation",
+    )
+    n_split_phrase_samples_val: int = Field(default=0, ge=0)
 
     # TTS parameters (Piper VITS + SLERP speaker blending)
     noise_scales: list[float] = Field(default_factory=lambda: [0.98])
@@ -155,6 +270,7 @@ class WakeWordConfig(BaseModel):
     label_smoothing: float = 0.05
     max_negative_weight: float = 1500.0
     target_fp_per_hour: float = 0.2
+    streaming_eval: StreamingEvalConfig = Field(default_factory=StreamingEvalConfig)
     batch_n_per_class: dict[str, int] = Field(
         default_factory=lambda: {
             "positive": 50,
@@ -163,6 +279,22 @@ class WakeWordConfig(BaseModel):
             "background_noise": 50,
         }
     )
+    # Embedding mixup: Beta(alpha, alpha) interpolation of sample pairs. 0 disables it.
+    mixup_alpha: float = 0.2
+    # batch_n_per_class keys kept out of mixup (e.g. ["adversarial_negative"], so near-miss
+    # phrases are never blended into positives and the boundary between them stays sharp).
+    mixup_exclude_classes: list[str] = Field(default_factory=list)
+    # Max-pooling streaming loss: each example carries this many extra embedding steps
+    # (80 ms each) before the classifier's 16, the classifier scores every 16-step window
+    # and the loss uses the highest score. 0 trains on single windows. Needs
+    # augmentation.clip_duration >= 2.0 + 0.08 * max_pool_steps.
+    max_pool_steps: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def _check_negative_shares(self) -> Self:
+        if self.custom_negative_share + self.word_swap_share > 1.0:
+            raise ValueError("custom_negative_share + word_swap_share must not exceed 1.0")
+        return self
 
     @model_validator(mode="after")
     def _warn_unknown_batch_keys(self) -> Self:
@@ -175,9 +307,24 @@ class WakeWordConfig(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _check_max_pool_clip_duration(self) -> Self:
+        min_duration = 2.0 + 0.08 * self.max_pool_steps
+        if self.max_pool_steps and self.augmentation.clip_duration < min_duration - 1e-6:
+            raise ValueError(
+                f"max_pool_steps={self.max_pool_steps} needs augmentation.clip_duration >= "
+                f"{min_duration:.2f}s, got {self.augmentation.clip_duration}s"
+            )
+        return self
+
     @property
     def model_output_dir(self) -> Path:
         return Path(self.output_dir) / self.model_name
+
+    @property
+    def feature_steps(self) -> int:
+        """Embedding steps per training example (16 plus any max-pooling context)."""
+        return 16 + self.max_pool_steps
 
     @property
     def data_path(self) -> Path:

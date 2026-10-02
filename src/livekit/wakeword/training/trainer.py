@@ -21,8 +21,12 @@ from ..data.dataset import create_dataloader
 from ..models.pipeline import WakeWordClassifier
 from ..utils import get_device
 from .metrics import evaluate_model, find_best_threshold
+from .validation import ValidationData, debounce_hops, load_validation_data, score_stream
 
 logger = logging.getLogger(__name__)
+
+# Embedding steps the classifier takes per window
+N_CLASSIFIER_STEPS = 16
 
 
 class _Checkpoint(TypedDict):
@@ -93,9 +97,11 @@ class WakeWordTrainer:
         self.device = device or get_device()
         self.model = WakeWordClassifier(config).to(self.device)
         self.checkpoints: list[_Checkpoint] = []
+        self._class_names: list[str] = []
         self._metrics_log: list[dict[str, object]] = []
         self._metrics_path = config.model_output_dir / f"{config.model_name}_metrics.json"
         self._train_start: float = 0.0
+        self._validation_data: ValidationData | None = None
 
     def _build_dataloader(self) -> torch.utils.data.DataLoader:  # type: ignore[type-arg]
         model_dir = self.config.model_output_dir
@@ -135,44 +141,69 @@ class WakeWordTrainer:
             "background_noise": lambda _: 0,
         }
 
+        # Class ids yielded with each batch index into this list (data_files order).
+        self._class_names = list(data_files)
         return create_dataloader(
             data_files=data_files,
             n_per_class=self.config.batch_n_per_class,
             label_funcs={k: v for k, v in label_funcs.items() if k in data_files},
+            seq_len=self.config.feature_steps,
+            with_class_ids=True,
         )
 
-    def _load_validation_data(self) -> tuple[np.ndarray, np.ndarray]:
-        """Load test features for validation."""
-        model_dir = self.config.model_output_dir
-        pos_path = model_dir / "positive_features_test.npy"
-        neg_path = model_dir / "negative_features_test.npy"
+    def _load_validation_data(self) -> ValidationData:
+        """Load validation clips and stream once; they don't change during training."""
+        if self._validation_data is None:
+            self._validation_data = load_validation_data(self.config)
+            v = self._validation_data
+            logger.info(
+                "Validation: %d positive clips, %d negative clips, %.1f h negative stream",
+                v.positive.shape[0], v.negative_clips.shape[0], v.stream_hours,
+            )
+        return self._validation_data
 
-        pos = np.load(str(pos_path)) if pos_path.exists() else np.zeros((0, 16, 96))
-        neg = np.load(str(neg_path)) if neg_path.exists() else np.zeros((0, 16, 96))
+    def _score(self, features: torch.Tensor) -> torch.Tensor:
+        """Score (batch, steps, 96) features, returning (batch,) scores.
 
-        # Also load background noise test features if available
-        bg_test_path = model_dir / "background_noise_features_test.npy"
-        if bg_test_path.exists():
-            bg_neg = np.load(str(bg_test_path))
-            neg = np.concatenate([neg, bg_neg], axis=0) if neg.shape[0] > 0 else bg_neg
+        Examples longer than the classifier's 16 steps (``max_pool_steps``) are scored on
+        every 16-step window, as a stream would be, and keep their highest score.
+        """
+        window = N_CLASSIFIER_STEPS
+        if features.shape[1] == window:
+            scores: torch.Tensor = self.model(features).squeeze(-1)
+            return scores
+        batch, _, dim = features.shape
+        windows = features.unfold(1, window, 1)  # (batch, n_windows, dim, window)
+        windows = windows.permute(0, 1, 3, 2).reshape(-1, window, dim)
+        window_scores: torch.Tensor = self.model(windows).view(batch, -1)
+        return window_scores.amax(dim=1)
 
-        # Also load validation features if available
-        val_path = self.config.data_path / "features" / "validation_set_features.npy"
-        if val_path.exists():
-            val_neg = np.load(str(val_path))
-            # Reshape 2D (N, 96) → 3D (N//16, 16, 96) if needed
-            if val_neg.ndim == 2:
-                n_full = (val_neg.shape[0] // 16) * 16
-                remainder = val_neg.shape[0] - n_full
-                if remainder > 0:
-                    logger.warning(
-                        "Dropping %d/%d validation samples (not divisible by 16)",
-                        remainder, val_neg.shape[0],
-                    )
-                val_neg = val_neg[:n_full].reshape(-1, 16, 96)
-            neg = np.concatenate([neg, val_neg], axis=0) if neg.shape[0] > 0 else val_neg
+    def _mixup(
+        self, features: torch.Tensor, labels: torch.Tensor, class_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Embedding mixup: blend random pairs of samples and their labels.
 
-        return pos, neg
+        Classes in ``mixup_exclude_classes`` are left as they are and never blended in.
+        """
+        alpha = self.config.mixup_alpha
+        if alpha <= 0:
+            return features, labels
+        excluded = [
+            i
+            for i, name in enumerate(self._class_names)
+            if name in self.config.mixup_exclude_classes
+        ]
+        mixable = ~torch.isin(class_ids, torch.tensor(excluded, device=class_ids.device))
+        idx = torch.nonzero(mixable).squeeze(1)
+        if idx.numel() < 2:
+            return features, labels
+        partner = idx[torch.randperm(idx.numel(), device=idx.device)]
+        lam = torch.distributions.Beta(alpha, alpha).sample().to(features.device)
+        features = features.clone()
+        labels = labels.clone()
+        features[idx] = lam * features[idx] + (1 - lam) * features[partner]
+        labels[idx] = lam * labels[idx] + (1 - lam) * labels[partner]
+        return features, labels
 
     @torch.no_grad()
     def _predict(self, features: np.ndarray, batch_size: int = 512) -> np.ndarray:
@@ -180,24 +211,40 @@ class WakeWordTrainer:
         self.model.eval()
         all_preds: list[np.ndarray] = []
         for i in range(0, len(features), batch_size):
-            batch = torch.from_numpy(features[i : i + batch_size]).to(self.device)
-            preds = self.model(batch).cpu().numpy()
-            all_preds.append(preds)
-        return np.concatenate(all_preds, axis=0).squeeze(-1)
+            batch = torch.from_numpy(features[i : i + batch_size]).float().to(self.device)
+            all_preds.append(self._score(batch).cpu().numpy())
+        if not all_preds:
+            return np.zeros(0, dtype=np.float32)
+        return np.concatenate(all_preds, axis=0)
+
+    def _validation_scores(self) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+        """Scores for positive clips, negative clips and every hop of the negative stream."""
+        data = self._load_validation_data()
+        if data.positive.shape[0] == 0:
+            return None
+        pos_preds = self._predict(data.positive)
+        neg_preds = (
+            self._predict(data.negative_clips)
+            if data.negative_clips.shape[0]
+            else np.zeros(0, dtype=np.float32)
+        )
+        stream_preds = score_stream(self._predict, data.stream)
+        return pos_preds, neg_preds, stream_preds
 
     def _validate(self) -> dict[str, float]:
         """Run validation and return metrics."""
-        pos_features, neg_features = self._load_validation_data()
-        if pos_features.shape[0] == 0:
+        scores = self._validation_scores()
+        if scores is None:
             return {"fpph": 0.0, "recall": 0.0, "accuracy": 0.0, "threshold": 0.5}
-        pos_preds = self._predict(pos_features)
-        neg_preds = self._predict(neg_features) if neg_features.shape[0] > 0 else np.array([])
-
-        # Compute actual validation hours from clip count × clip duration
-        clip_duration = self.config.augmentation.clip_duration
-        validation_hours = neg_features.shape[0] * clip_duration / 3600.0
+        pos_preds, neg_preds, stream_preds = scores
         return evaluate_model(
-            pos_preds, neg_preds, threshold=0.5, validation_hours=validation_hours,
+            pos_preds,
+            neg_preds,
+            threshold=0.5,
+            validation_hours=self._load_validation_data().clip_hours,
+            stream_preds=stream_preds,
+            debounce_hops=debounce_hops(self.config),
+            min_consecutive=self.config.streaming_eval.min_consecutive,
         )
 
     def _log_metrics(self, step: int, phase: int, metrics: dict[str, float]) -> None:
@@ -256,30 +303,26 @@ class WakeWordTrainer:
         for step in pbar:
             # Get batch
             try:
-                features, labels = next(data_iter)
+                features, labels, class_ids = next(data_iter)
             except StopIteration:
                 data_iter = iter(dataloader)
-                features, labels = next(data_iter)
+                features, labels, class_ids = next(data_iter)
 
             features = features.to(self.device)
             labels = labels.to(self.device)
+            class_ids = class_ids.to(self.device)
 
             # Embedding mixup: interpolate random pairs of samples and their
             # labels to create virtual training examples. This regularizes in
             # embedding space without touching the audio pipeline.
-            mixup_alpha = 0.2
-            if mixup_alpha > 0:
-                lam = torch.distributions.Beta(mixup_alpha, mixup_alpha).sample().to(self.device)
-                perm = torch.randperm(features.size(0), device=self.device)
-                features = lam * features + (1 - lam) * features[perm]
-                labels = lam * labels + (1 - lam) * labels[perm]
+            features, labels = self._mixup(features, labels, class_ids)
 
             # Label smoothing: 0→ε, 1→1-ε to prevent overconfident predictions
             if label_smoothing > 0:
                 labels = labels * (1 - label_smoothing) + 0.5 * label_smoothing
 
-            # Forward
-            predictions = self.model(features).squeeze(-1)
+            # Forward (max over windows when examples carry max_pool_steps of context)
+            predictions = self._score(features)
 
             # Focal loss replaces BCE + manual hard-example mining.
             # gamma=2.0 automatically down-weights well-classified samples,
@@ -388,18 +431,18 @@ class WakeWordTrainer:
 
     def _find_optimal_threshold(self) -> dict[str, float]:
         """Find best detection threshold on validation data."""
-        pos_features, neg_features = self._load_validation_data()
-        if pos_features.shape[0] == 0:
+        scores = self._validation_scores()
+        if scores is None:
             return {"fpph": 0.0, "recall": 0.0, "accuracy": 0.0, "threshold": 0.5}
-        pos_preds = self._predict(pos_features)
-        neg_preds = self._predict(neg_features) if neg_features.shape[0] > 0 else np.array([])
-
-        clip_duration = self.config.augmentation.clip_duration
-        validation_hours = neg_features.shape[0] * clip_duration / 3600.0
+        pos_preds, neg_preds, stream_preds = scores
         return find_best_threshold(
-            pos_preds, neg_preds,
-            validation_hours=validation_hours,
+            pos_preds,
+            neg_preds,
+            validation_hours=self._load_validation_data().clip_hours,
             target_fpph=self.config.target_fp_per_hour,
+            stream_preds=stream_preds,
+            debounce_hops=debounce_hops(self.config),
+            min_consecutive=self.config.streaming_eval.min_consecutive,
         )
 
     def _average_best_checkpoints(self) -> nn.Module:

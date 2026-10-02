@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import random
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -52,7 +54,6 @@ class AudioAugmentor:
                 ]
             )
         return self._per_sample_aug
-
 
     def apply_rir(self, audio: np.ndarray, p: float = 0.5) -> np.ndarray:
         """Convolve audio with a random room impulse response."""
@@ -119,8 +120,9 @@ def align_clip_to_end(
 ) -> np.ndarray:
     """Align a clip to the END of the target window with random jitter.
 
-    Positive and negative clips are both placed at the end of the window with 0-200ms
-    jitter; clips longer than the window keep their end.
+    Positive and negative clips are both placed at the end of the window with
+    0..*jitter_samples* jitter (``augmentation.end_jitter`` in the pipeline); clips
+    longer than the window keep their end.
     """
     return _align_clip_to_end(audio, target_length, jitter_samples)[0]
 
@@ -152,16 +154,135 @@ def _pad_or_crop_center(audio: np.ndarray, target_length: int) -> np.ndarray:
 
 
 _ALL_SPLITS = [
-    "positive_train", "positive_test",
-    "negative_train", "negative_test",
-    "background_train", "background_test",
+    "positive_train",
+    "positive_test",
+    "negative_train",
+    "negative_test",
+    "background_train",
+    "background_test",
 ]
+
+_ORIGINAL_RE = re.compile(r"^clip_\d{6}\.wav$")
+
+
+def _original_clips(clip_dir: Path) -> list[Path]:
+    """Original TTS clips (``clip_000000.wav``) in *clip_dir*, sorted; no augmented ones."""
+    if not clip_dir.is_dir():
+        return []
+    return sorted(p for p in clip_dir.glob("*.wav") if _ORIGINAL_RE.match(p.name))
+
+
+def _read_mono(path: Path) -> np.ndarray:
+    import soundfile as sf
+
+    audio, _ = sf.read(str(path))
+    if audio.ndim > 1:
+        audio = audio[:, 0]
+    return np.asarray(audio, dtype=np.float32)
+
+
+@dataclass
+class SpeechPlacement:
+    """How a speech clip is laid out in the window before RIR and noise.
+
+    The clip always ends ``0..end_jitter`` samples before the end of the window. The
+    padding before it can be filled with other speech (*context*) that ends a short
+    gap before the phrase, as in a live stream where the wake word follows talk.
+    Positives can also be rebuilt from two halves of the phrase with a pause between.
+    """
+
+    end_jitter: int = 4800
+    context_clips: list[Path] = field(default_factory=list)
+    context_probability: float = 0.0
+    near_miss_clips: list[Path] = field(default_factory=list)
+    near_miss_probability: float = 0.0
+    context_gap: tuple[int, int] = (0, 6400)
+    split_pairs: list[tuple[Path, Path]] = field(default_factory=list)
+    split_probability: float = 0.0
+    split_gap: tuple[int, int] = (1600, 8000)
+
+    def phrase_audio(self, original: Path, positive: bool) -> np.ndarray:
+        """The clip to place: *original*, or for a positive maybe a split-phrase pair."""
+        if positive and self.split_pairs and random.random() < self.split_probability:
+            left_path, right_path = random.choice(self.split_pairs)
+            gap = np.zeros(random.randint(*self.split_gap), dtype=np.float32)
+            return np.concatenate([_read_mono(left_path), gap, _read_mono(right_path)])
+        return _read_mono(original)
+
+    def context_audio(self, positive: bool) -> np.ndarray | None:
+        """Speech to put before the phrase, or ``None`` for none."""
+        if positive and self.near_miss_clips and random.random() < self.near_miss_probability:
+            return _read_mono(random.choice(self.near_miss_clips))
+        if self.context_clips and random.random() < self.context_probability:
+            return _read_mono(random.choice(self.context_clips))
+        return None
+
+    def place(
+        self,
+        audio: np.ndarray,
+        target_length: int,
+        context: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, int, int]:
+        """End-align *audio* and fill the padding with *context*.
+
+        Returns the window and the ``[start, end)`` span of *audio* in it.
+        """
+        window, start, end = _align_clip_to_end(audio, target_length, self.end_jitter)
+        if context is not None and len(context) > 0:
+            ctx_end = start - random.randint(*self.context_gap)
+            if ctx_end > 0:
+                ctx = context[-ctx_end:]
+                # Context talk at a similar level, sometimes a bit quieter
+                ref = float(np.sqrt(np.mean(audio**2))) if len(audio) else 0.0
+                rms = float(np.sqrt(np.mean(ctx**2))) + 1e-8
+                gain = (ref / rms if ref > 0 else 1.0) * 10 ** (random.uniform(-6.0, 0.0) / 20)
+                window[ctx_end - len(ctx) : ctx_end] = ctx * gain
+        return window, start, end
+
+
+def _split_pairs(clip_dir: Path) -> list[tuple[Path, Path]]:
+    """Consecutive (left, right) half-phrase clips: ``clip_2j`` and ``clip_2j+1``."""
+    by_idx = {int(p.stem.split("_")[1]): p for p in _original_clips(clip_dir)}
+    return [(by_idx[i], by_idx[i + 1]) for i in sorted(by_idx) if i % 2 == 0 and i + 1 in by_idx]
+
+
+def build_placement(
+    config: WakeWordConfig, split: str, sample_rate: int = 16000
+) -> SpeechPlacement:
+    """The :class:`SpeechPlacement` for *split* (``positive_train``, ``negative_test``, ...)."""
+    aug = config.augmentation
+    model_dir = config.model_output_dir
+    suffix = split.rsplit("_", 1)[-1]  # train / test
+
+    def samples(r: tuple[float, float]) -> tuple[int, int]:
+        lo, hi = sorted(r)
+        return int(lo * sample_rate), int(hi * sample_rate)
+
+    placement = SpeechPlacement(
+        end_jitter=int(aug.end_jitter * sample_rate),
+        context_gap=samples(aug.context_gap),
+        split_gap=samples(aug.split_phrase_gap),
+    )
+    if aug.context_speech_probability > 0:
+        placement.context_clips = _original_clips(model_dir / "context_speech")
+        placement.context_probability = aug.context_speech_probability
+    if split.startswith("positive"):
+        if aug.near_miss_context_probability > 0:
+            placement.near_miss_clips = _original_clips(model_dir / f"negative_{suffix}")
+            placement.near_miss_probability = aug.near_miss_context_probability
+        if aug.split_phrase_probability > 0:
+            placement.split_pairs = _split_pairs(model_dir / f"positive_{suffix}_parts")
+            placement.split_probability = aug.split_phrase_probability
+    return placement
 
 
 def run_augment(config: WakeWordConfig) -> None:
-    """Run augmentation pipeline on generated clips."""
-    import re
+    """Run augmentation pipeline on generated clips.
 
+    Every round starts again from the original TTS clips and draws a new
+    placement, context, RIR and noise, so ``rounds`` gives that many independent
+    variants of each clip.
+    """
     target_duration = config.augmentation.clip_duration
 
     model_dir = config.model_output_dir
@@ -189,6 +310,15 @@ def run_augment(config: WakeWordConfig) -> None:
             "clip padding will stay digital silence, which live audio never contains"
         )
 
+    placements = {split: build_placement(config, split) for split in _ALL_SPLITS}
+    aug = config.augmentation
+    for split, placement in placements.items():
+        if aug.context_speech_probability > 0 and not placement.context_clips:
+            logger.warning(f"{split}: no context_speech clips; set n_context_samples and generate")
+        if split.startswith("positive") and aug.split_phrase_probability > 0:
+            if not placement.split_pairs:
+                logger.warning(f"{split}: no split-phrase clips; set n_split_phrase_samples")
+
     for round_idx in range(config.augmentation.rounds):
         logger.info(f"Augmentation round {round_idx + 1}/{config.augmentation.rounds}")
         for split in _ALL_SPLITS:
@@ -204,6 +334,8 @@ def run_augment(config: WakeWordConfig) -> None:
                 end_align=not split.startswith("background"),
                 round_idx=round_idx,
                 target_duration_s=target_duration,
+                placement=placements[split],
+                positive=split.startswith("positive"),
             )
 
 
@@ -214,57 +346,46 @@ def _augment_directory(
     target_duration_s: float = 2.0,
     sample_rate: int = 16000,
     round_idx: int = 0,
+    placement: SpeechPlacement | None = None,
+    positive: bool = False,
 ) -> None:
-    """Augment all WAV files in a directory.
+    """Augment all original WAV files in a directory into ``clip_000000_r{round_idx}.wav``.
 
-    Round 0 reads the original TTS clips (``clip_000000.wav``).
-    Subsequent rounds read the previous round's output so that
-    augmentation compounds (stacks) progressively.  Every round
-    writes to its own file (``clip_000000_r0.wav``, ``_r1.wav``, …)
-    so the originals are always preserved.
+    Every round reads the original TTS clips (``clip_000000.wav``) and draws a
+    fresh placement, RIR and noise, so rounds are independent variants rather
+    than stacked layers of reverb and noise.
 
-    On round 0, speech clips (``end_align``: positives and negatives alike) are
-    end-aligned with jitter and background clips are center-padded/cropped. This
-    happens *before* RIR and background mixing, so reverb tails stay inside the
-    window and the noise covers the padding. Otherwise the classifier can learn
-    where the digital silence sits instead of how the phrase sounds. A streaming
-    listener slides every phrase through the end of its window, so that shortcut
-    makes near-miss phrases fire.
+    Speech clips (``end_align``: positives and negatives alike) are end-aligned
+    with jitter, optionally after other speech (see :class:`SpeechPlacement`);
+    background clips are center-padded/cropped. This happens *before* RIR and
+    background mixing, so reverb tails stay inside the window and the noise
+    covers the padding. Otherwise the classifier can learn where the digital
+    silence sits instead of how the phrase sounds. A streaming listener slides
+    every phrase through the end of its window, so that shortcut makes near-miss
+    phrases fire.
     """
-    import re
-
     import soundfile as sf
     from tqdm import tqdm
 
     target_length = int(target_duration_s * sample_rate)
+    placement = placement if placement is not None else SpeechPlacement()
 
-    if round_idx == 0:
-        # Round 0: read original TTS clips
-        _src_re = re.compile(r"^clip_\d{6}\.wav$")
-    else:
-        # Round N: read previous round's output
-        _src_re = re.compile(rf"^clip_\d{{6}}_r{round_idx - 1}\.wav$")
-
-    wav_files = sorted(p for p in clip_dir.glob("*.wav") if _src_re.match(p.name))
+    wav_files = _original_clips(clip_dir)
 
     for wav_path in tqdm(wav_files, desc=f"Augmenting {clip_dir.name} r{round_idx}", unit="clip"):
-        audio, sr = sf.read(str(wav_path))
-        if audio.ndim > 1:
-            audio = audio[:, 0]
-        audio = audio.astype(np.float32)
-
-        # Apply per-sample augmentations (to the unpadded clip on round 0)
-        audio = augmentor.augment_clip(audio)
-
-        # Align to target duration only on round 0 (raw TTS clips vary in
-        # length).  Later rounds already have the correct duration.
-        # [start, end) is the span the SNR is measured over.
-        start, end = 0, target_length
-        if round_idx == 0:
-            if end_align:
-                audio, start, end = _align_clip_to_end(audio, target_length)
-            else:
-                audio = _pad_or_crop_center(audio, target_length)
+        if end_align:
+            audio = placement.phrase_audio(wav_path, positive)
+            # Per-sample augmentations on the unpadded clip (and context separately)
+            audio = augmentor.augment_clip(audio)
+            context = placement.context_audio(positive)
+            if context is not None:
+                context = augmentor.augment_clip(context)
+            # [start, end) is the span the SNR is measured over.
+            audio, start, end = placement.place(audio, target_length, context)
+        else:
+            audio = augmentor.augment_clip(_read_mono(wav_path))
+            audio = _pad_or_crop_center(audio, target_length)
+            start, end = 0, target_length
 
         # Apply RIR
         audio = augmentor.apply_rir(audio)
@@ -275,7 +396,5 @@ def _augment_directory(
             audio, signal_power=float(np.mean(audio[start:end] ** 2))
         )
 
-        # Derive output name from the original stem (strip any _rN suffix)
-        orig_stem = re.sub(r"_r\d+$", "", wav_path.stem)
-        out_path = wav_path.with_name(f"{orig_stem}_r{round_idx}.wav")
+        out_path = wav_path.with_name(f"{wav_path.stem}_r{round_idx}.wav")
         sf.write(str(out_path), audio, sample_rate)

@@ -10,59 +10,10 @@ import numpy as np
 import onnxruntime as ort
 
 from ..config import WakeWordConfig
+from ..training.metrics import HOP_SECONDS, evaluate_model, find_best_threshold
+from ..training.validation import debounce_hops, load_validation_data, score_stream
 
 logger = logging.getLogger(__name__)
-
-
-def _load_validation_features(config: WakeWordConfig) -> tuple[np.ndarray, np.ndarray]:
-    """Load positive and negative validation features from pre-extracted .npy files.
-
-    Returns:
-        (positive_features, negative_features) each shaped (N, 16, 96).
-    """
-    model_dir = config.model_output_dir
-    pos_path = model_dir / "positive_features_test.npy"
-    neg_path = model_dir / "negative_features_test.npy"
-
-    pos = np.load(str(pos_path)) if pos_path.exists() else np.zeros((0, 16, 96))
-    neg = np.load(str(neg_path)) if neg_path.exists() else np.zeros((0, 16, 96))
-
-    # Also include background noise test features if available
-    bg_test_path = model_dir / "background_noise_features_test.npy"
-    if bg_test_path.exists():
-        bg_neg = np.load(str(bg_test_path))
-        neg = np.concatenate([neg, bg_neg], axis=0) if neg.shape[0] > 0 else bg_neg
-
-    # Also include general negative validation features if available
-    val_path = config.data_path / "features" / "validation_set_features.npy"
-    if val_path.exists():
-        val_neg = np.load(str(val_path))
-        if val_neg.ndim == 2:
-            n_full = (val_neg.shape[0] // 16) * 16
-            remainder = val_neg.shape[0] - n_full
-            if remainder > 0:
-                logger.warning(
-                    "Dropping %d/%d validation samples (not divisible by 16)",
-                    remainder,
-                    val_neg.shape[0],
-                )
-            val_neg = val_neg[:n_full].reshape(-1, 16, 96)
-        neg = np.concatenate([neg, val_neg], axis=0) if neg.shape[0] > 0 else val_neg
-
-    if pos.shape[0] == 0:
-        raise ValueError(
-            f"No positive validation features found at {pos_path}. "
-            "Run the generate/augment pipeline first."
-        )
-    if neg.shape[0] == 0:
-        raise ValueError(
-            f"No negative validation features found. "
-            f"Checked {neg_path} and {val_path}. "
-            "Run setup and the generate/augment pipeline first."
-        )
-
-    logger.info(f"Loaded {pos.shape[0]} positive, {neg.shape[0]} negative validation samples")
-    return pos, neg
 
 
 def _predict_onnx(
@@ -70,13 +21,28 @@ def _predict_onnx(
     features: np.ndarray,
     batch_size: int = 1,
 ) -> np.ndarray:
-    """Run ONNX model on feature batches, return scores array."""
-    input_name = session.get_inputs()[0].name
+    """Run ONNX model on feature batches, return scores array.
+
+    Clips longer than the classifier's 16 steps (``max_pool_steps``) are scored on every
+    16-step window and keep their highest score, as in training.
+    """
+    if features.ndim == 3 and features.shape[1] > 16:
+        n_clips, steps, dim = features.shape
+        windows = np.lib.stride_tricks.sliding_window_view(features, 16, axis=1)
+        windows = windows.transpose(0, 1, 3, 2).reshape(-1, 16, dim)
+        scores = _predict_onnx(session, windows, batch_size)
+        pooled: np.ndarray = scores.reshape(n_clips, steps - 15).max(axis=1)
+        return pooled
+    model_input = session.get_inputs()[0]
+    input_name = model_input.name
+    shape = getattr(model_input, "shape", None)
+    if shape and isinstance(shape[0], int):  # fixed batch size (e.g. some openWakeWord models)
+        batch_size = shape[0]
     all_scores: list[np.ndarray] = []
     for i in range(0, len(features), batch_size):
         batch = features[i : i + batch_size].astype(np.float32)
         outputs = session.run(None, {input_name: batch})
-        all_scores.append(outputs[0].squeeze(-1))
+        all_scores.append(outputs[0].reshape(-1))
     return np.concatenate(all_scores, axis=0)
 
 
@@ -198,38 +164,61 @@ def run_eval(config: WakeWordConfig, model_path: str | Path) -> dict[str, float]
     logger.info(f"Loaded model from {model_path}")
 
     # Load validation data
-    pos_features, neg_features = _load_validation_features(config)
+    data = load_validation_data(config)
+    if data.positive.shape[0] == 0:
+        raise ValueError(
+            f"No positive validation features found in {config.model_output_dir}. "
+            "Run the generate/augment pipeline first."
+        )
+    if data.negative_clips.shape[0] == 0 and data.stream.shape[0] == 0:
+        raise ValueError(
+            "No negative validation features found. "
+            "Run setup and the generate/augment pipeline first."
+        )
 
-    # Run predictions
+    # Run predictions. The validation stream is scored at every 80 ms hop.
     logger.info("Running predictions on validation set...")
-    pos_scores = _predict_onnx(session, pos_features)
-    neg_scores = _predict_onnx(session, neg_features)
+    pos_scores = _predict_onnx(session, data.positive, batch_size=256)
+    neg_scores = (
+        _predict_onnx(session, data.negative_clips, batch_size=256)
+        if data.negative_clips.shape[0]
+        else np.zeros(0, dtype=np.float32)
+    )
+    stream_scores = score_stream(
+        lambda x: _predict_onnx(session, x, batch_size=x.shape[0]), data.stream
+    )
 
-    # Compute DET curve
-    thresholds, fpr, fnr = _compute_det_curve(pos_scores, neg_scores)
+    # Compute DET curve (per-window rates over clips and stream hops)
+    thresholds, fpr, fnr = _compute_det_curve(
+        pos_scores, np.concatenate([neg_scores, stream_scores])
+    )
 
     # Compute AUT
     aut = _compute_aut(fpr, fnr)
 
     # Compute summary metrics at fixed threshold 0.5 for consistent comparison
-    clip_duration = config.augmentation.clip_duration
-    validation_hours = neg_features.shape[0] * clip_duration / 3600.0
-
-    from ..training.metrics import evaluate_model, find_best_threshold
-
+    hops = debounce_hops(config)
+    min_consecutive = config.streaming_eval.min_consecutive
     fixed = evaluate_model(
         pos_scores,
         neg_scores,
         threshold=0.5,
-        validation_hours=validation_hours,
+        validation_hours=data.clip_hours,
+        stream_preds=stream_scores,
+        debounce_hops=hops,
+        min_consecutive=min_consecutive,
     )
 
     optimal = find_best_threshold(
         pos_scores,
         neg_scores,
-        validation_hours=validation_hours,
+        validation_hours=data.clip_hours,
         target_fpph=config.target_fp_per_hour,
+        stream_preds=stream_scores,
+        debounce_hops=hops,
+        min_consecutive=min_consecutive,
     )
+    validation_hours = data.clip_hours + stream_scores.shape[0] * HOP_SECONDS / 3600.0
 
     # Build results
     results = {
@@ -241,8 +230,8 @@ def run_eval(config: WakeWordConfig, model_path: str | Path) -> dict[str, float]
         "optimal_threshold": optimal["threshold"],
         "optimal_recall": optimal["recall"],
         "optimal_fpph": optimal["fpph"],
-        "n_positive": int(pos_features.shape[0]),
-        "n_negative": int(neg_features.shape[0]),
+        "n_positive": int(pos_scores.shape[0]),
+        "n_negative": int(neg_scores.shape[0] + stream_scores.shape[0]),
         "validation_hours": round(validation_hours, 2),
     }
 

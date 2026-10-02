@@ -144,12 +144,41 @@ This prevents the model from producing overconfident sigmoid outputs (very close
 During training, random pairs of samples within each batch are interpolated in embedding space:
 
 ```
-λ ~ Beta(0.2, 0.2)
+λ ~ Beta(α, α)          # α = mixup_alpha, default 0.2; 0 disables mixup
 features_mixed = λ · features + (1-λ) · features[permutation]
 labels_mixed = λ · labels + (1-λ) · labels[permutation]
 ```
 
 The Beta(0.2, 0.2) distribution produces mixing coefficients that are usually close to 0 or 1 (light interpolation), creating virtual training examples near the original data points. This regularizes the classifier without requiring changes to the audio augmentation pipeline.
+
+Classes listed in `mixup_exclude_classes` (keys of `batch_n_per_class`) are neither mixed nor
+used as mixing partners. Excluding `adversarial_negative` keeps near-miss phrases from being
+blended into positives, which would otherwise train on half-labels exactly at the boundary
+between the wake word and its near-misses.
+
+### Near-Miss Share
+
+`batch_n_per_class.adversarial_negative` sets how many near-miss clips each batch holds
+(default 50, against 1024 ACAV100M clips). Raising it, for example to 200, puts more of the
+loss on phrases that sound like the wake word.
+
+## Max-Pooling Streaming Loss
+
+A live listener scores the stream every 80 ms, so the phrase can sit anywhere near the end of
+the window when it should fire. With `max_pool_steps: K`, each training example carries K extra
+embedding steps (80 ms each) of context before the classifier's 16. The trainer scores every
+16-step window of the example and the loss uses the highest score:
+
+- positives only need one window to score high, the best-aligned one;
+- negatives are penalized on their highest-scoring window, so no window may fire.
+
+This follows the max-pooling loss of [Sun et al., 2017](https://arxiv.org/abs/1705.02411).
+Validation scores examples the same way. The exported classifier still takes 16 steps.
+
+Longer examples need longer clips: set `augmentation.clip_duration` to at least
+`2.0 + 0.08 × K` seconds (e.g. 2.32 s for K = 4), then re-run augment and extraction. Config
+loading rejects a shorter clip. The ACAV100M negatives are contiguous, so they are cut into
+blocks of 16 + K steps.
 
 ## Validation
 
@@ -263,6 +292,9 @@ All `.wav` files are collected recursively. Set `n_background_samples: 0` and `n
 | `batch_n_per_class.adversarial_negative` | 50 |
 | `batch_n_per_class.ACAV100M_sample` | 1024 |
 | `batch_n_per_class.background_noise` | 50 |
+| `mixup_alpha` | 0.2 |
+| `mixup_exclude_classes` | `[]` |
+| `max_pool_steps` | 0 (off) |
 
 ## Classifier Architectures
 

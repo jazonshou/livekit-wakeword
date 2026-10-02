@@ -18,12 +18,14 @@ logger = logging.getLogger(__name__)
 N_EMBEDDING_TIMESTEPS = 16
 
 
-def _pad_or_truncate(embeddings: np.ndarray) -> np.ndarray:
-    """Take last N_EMBEDDING_TIMESTEPS or left-pad a (n_windows, 96) embedding."""
-    if embeddings.shape[0] >= N_EMBEDDING_TIMESTEPS:
-        return embeddings[-N_EMBEDDING_TIMESTEPS:]
+def _pad_or_truncate(
+    embeddings: np.ndarray, n_timesteps: int = N_EMBEDDING_TIMESTEPS
+) -> np.ndarray:
+    """Take the last *n_timesteps* or left-pad a (n_windows, 96) embedding."""
+    if embeddings.shape[0] >= n_timesteps:
+        return embeddings[-n_timesteps:]
     pad = np.zeros(
-        (N_EMBEDDING_TIMESTEPS - embeddings.shape[0], 96),
+        (n_timesteps - embeddings.shape[0], 96),
         dtype=np.float32,
     )
     return np.concatenate([pad, embeddings], axis=0)
@@ -33,11 +35,12 @@ def extract_features_from_directory(
     clip_dir: Path,
     mel_frontend: MelSpectrogramFrontend,
     speech_embedding: SpeechEmbedding,
+    n_timesteps: int = N_EMBEDDING_TIMESTEPS,
 ) -> np.ndarray:
-    """Extract (N_clips, 16, 96) features from a directory of WAV files.
+    """Extract (N_clips, n_timesteps, 96) features from a directory of WAV files.
 
     Processes clips through MelSpectrogramFrontend → SpeechEmbedding,
-    then takes last 16 embedding timesteps per clip.
+    then takes the last *n_timesteps* embedding timesteps per clip.
     """
     import re
 
@@ -49,7 +52,7 @@ def extract_features_from_directory(
     wav_files = sorted(p for p in clip_dir.glob("*.wav") if _aug_re.match(p.name))
     if not wav_files:
         logger.warning(f"No WAV files in {clip_dir}")
-        return np.zeros((0, N_EMBEDDING_TIMESTEPS, 96), dtype=np.float32)
+        return np.zeros((0, n_timesteps, 96), dtype=np.float32)
 
     all_features: list[np.ndarray] = []
 
@@ -61,12 +64,12 @@ def extract_features_from_directory(
 
         mel = mel_frontend(audio)
         embeddings = speech_embedding.extract_embeddings(mel)
-        all_features.append(_pad_or_truncate(embeddings[0]))
+        all_features.append(_pad_or_truncate(embeddings[0], n_timesteps))
 
     if not all_features:
-        return np.zeros((0, N_EMBEDDING_TIMESTEPS, 96), dtype=np.float32)
+        return np.zeros((0, n_timesteps, 96), dtype=np.float32)
 
-    return np.stack(all_features, axis=0)  # (N_clips, 16, 96)
+    return np.stack(all_features, axis=0)  # (N_clips, n_timesteps, 96)
 
 
 def run_extraction(config: WakeWordConfig, sess_options: SessionOptions | None = None) -> None:
@@ -101,6 +104,7 @@ def run_extraction(config: WakeWordConfig, sess_options: SessionOptions | None =
             clip_dir=clip_dir,
             mel_frontend=mel_frontend,
             speech_embedding=speech_embedding,
+            n_timesteps=config.feature_steps,
         )
 
         out_path = model_dir / feature_filename

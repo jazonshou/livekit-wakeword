@@ -138,6 +138,10 @@ class WakeWordModel:
 
         # Use last 16 embeddings
         emb_sequence = np.stack(embeddings[-MIN_EMBEDDINGS:], axis=0)
+        return self._score_embeddings(emb_sequence)
+
+    def _score_embeddings(self, emb_sequence: np.ndarray) -> dict[str, float]:
+        """Run every loaded classifier on a ``(16, 96)`` embedding sequence."""
         emb_input = emb_sequence[np.newaxis, :, :].astype(np.float32)
 
         predictions = {}

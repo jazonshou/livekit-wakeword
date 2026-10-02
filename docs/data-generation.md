@@ -65,10 +65,10 @@ If you omit `--config`, setup uses `--data-dir` (default `./data`) and **always*
 
 The VITS model contains 904 speaker embeddings. For each batch:
 
-1. **Speaker pairs** are cycled through all `(i, j)` combinations of speaker IDs
+1. **Speaker pairs** are drawn at random (seeded by `seed`, a pure function of the clip index so resumes match) from the training voices, so even a short split spreads over all speakers. `test_voice_fraction` (default 0.1) of the speakers are held out and used only for the `*_test` splits, so test scores measure voices the model never trained on
 2. **SLERP** interpolates the two speaker embeddings at each configured weight (e.g., 0.2 = close to speaker 1, 0.5 = midpoint, 0.8 = close to speaker 2)
 3. The blended embedding is used for inference, producing a voice that sounds like neither original speaker. Multiple weights generate more diverse voices from each pair
-4. Audio is resampled from 22050 Hz to 16000 Hz and silence-trimmed via WebRTC VAD
+4. Audio is resampled from 22050 Hz to 16000 Hz and leading/trailing silence is trimmed via WebRTC VAD
 
 With 904 speakers, there are ~409,000 unique speaker pairs, each producing distinct vocal characteristics.
 
@@ -86,7 +86,9 @@ Each clip is synthesized with a combination of:
 | `slerp_weights` | `[0.2, 0.35, 0.5, 0.65, 0.8]` | Speaker interpolation weights (0=speaker1, 1=speaker2) |
 | `max_speakers` | `null` | Cap on speaker IDs (null = all 904) |
 
-The Cartesian product of `slerp_weights`, `length_scales`, `noise_scales`, and `noise_scale_ws` creates multiple prosody variations. Speaker pairs and settings are cycled until `n_samples` clips are generated.
+The Cartesian product of `slerp_weights`, `length_scales`, `noise_scales`, and `noise_scale_ws` creates multiple prosody variations, cycled per batch until `n_samples` clips are generated.
+
+Clause punctuation reaches the model: each clause is phonemized separately and rejoined with its `,` `.` `;` `:` `!` `?`, so `"hey, computer"` is synthesized with a pause (the `espeak-ng --ipa` CLI drops it otherwise).
 
 ### Model artifacts
 
@@ -94,7 +96,7 @@ The default `en-us-libritts-high.pt` VITS checkpoint (~166 MB) and its `.json` c
 
 ### Silence Trimming
 
-Generated audio is silence-trimmed via WebRTC VAD. If the VAD strips too aggressively (result shorter than 150ms of content beyond the leading samples), the original untrimmed audio is kept instead.
+Only leading and trailing silence is trimmed: the clip keeps everything from 60 ms before the first WebRTC VAD speech frame to 60 ms after the last one, including pauses inside the phrase. If the VAD finds no speech, the clip is kept as is.
 
 ## VoxCPM2 (`tts_backend: voxcpm`)
 
@@ -102,7 +104,7 @@ Generated audio is silence-trimmed via WebRTC VAD. If the VAD strips too aggress
 
 **Weights on disk:** `livekit-wakeword setup --config your.yaml` runs `snapshot_download(repo_id=voxcpm_tts.model_id, ...)` into `voxcpm_local_model_path`. By default this is `data_dir/voxcpm/VoxCPM2` (`voxcpm_tts.model_cache_relpath`), or `voxcpm_tts.local_model_path` if set (relative to `data_dir` or absolute). If that directory is already non-empty, setup skips the download (e.g. you prefetched or copied weights there).
 
-**Diversification:** Defaults cover many `voice_design_prompts` × `cfg_values` × `inference_timesteps_list` (see `VoxCpmTtsConfig` in `config.py`). Clip *i* cycles through that Cartesian product so resumes stay aligned with `start_index`. Output is **16 kHz** `clip_%06d.wav` (model native rate is resampled with librosa).
+**Diversification:** Defaults cover many `voice_design_prompts` × `cfg_values` × `inference_timesteps_list` (see `VoxCpmTtsConfig` in `config.py`). Clip *i* cycles through that Cartesian product so resumes stay aligned with `start_index`. `test_voice_fraction` of the prompts are held out for the `*_test` splits. Output is **16 kHz** `clip_%06d.wav` (model native rate is resampled with librosa).
 
 ## Adversarial Phrase Generation
 
@@ -113,22 +115,40 @@ Generated audio is silence-trimmed via WebRTC VAD. If the VAD strips too aggress
 1. Load the CMU Pronouncing Dictionary via NLTK
 2. For each target phrase:
    - **Expand unknown words:** Words not in CMUDict are split into known subwords (e.g., `"livekit"` → `["live", "kit"]`). The split tries all positions and prefers the longest left match. This enables phoneme substitutions on made-up/compound words that CMUDict doesn't contain.
-   - Get the phoneme sequence for each word (with regex stress wildcards on vowels)
-   - Generate regex patterns by replacing 1 to `max_replace` phonemes (default: `len(phones) - 2`) with a wildcard `(.){1,3}`
-   - Search CMUDict with each regex pattern via `pronouncing.search()` to find phonetically similar words
-   - Exclude homophones (same pronunciation = not adversarial)
-   - With probability `include_partial_phrase` (default: 1.0), generate all partial phrases (each word removed in turn)
+   - Replace each word in turn with its **phonetic neighbours** (`phonetic_neighbours()`): CMUDict words whose pronunciation (stress ignored) is one phoneme substitution, insertion or deletion away, or two for words of 5+ phonemes (`max_distance`). For "zuck" (`Z AH K`) that is duck, luck, zach, zucker, ... Homophones are excluded.
+   - With probability `include_partial_phrase` (default: 1.0), generate all partial phrases (each word removed in turn), so neither half of the phrase alone is a positive
    - Include individual words with probability `include_input_words` (default: 0.2)
 3. **Remove exact target phrases** from the adversarial list (safety filter)
-4. Deduplicate and shuffle. When `n_phrases` is `None` (default), all unique phrases are returned with no cap.
+4. Deduplicate and shuffle (seeded). When `n_phrases` is `None` (default), all unique phrases are returned with no cap.
 
-### Regex Phoneme Replacement
+An earlier version searched CMUDict with an unanchored regex, which matched every word that merely *contained* the phonemes ("hey abdicate" for "hey zuck"), so true one-phoneme neighbours were a small fraction of the negatives.
 
-For each word, phonemes are replaced with a broad regex wildcard `(.){1,3}` that matches any 1-3 phoneme characters. All combinations of 1 to `max_replace` replacement positions are tried, generating patterns that range from single-phoneme swaps (close neighbors) to multi-phoneme replacements (more distant matches). This is the same approach used by openWakeWord: broad enough to catch phonetically similar words without requiring a hand-curated substitution map.
+### Word swaps
+
+With `word_swap_share > 0`, `generate_word_swap_phrases()` swaps each word of the phrase for common words and names (`word_swap_words`, default a built-in list: "hey there", "hey siri", "jack computer", ...).
+
+### Phrase mix and held-out phrases
+
+`run_generate` gives each group of negative phrases a fixed share of the clips instead of cycling one combined list:
+
+| Group | Share |
+|-------|-------|
+| `custom_negative_phrases` | `custom_negative_share` (default 0.3, when any are set) |
+| word swaps | `word_swap_share` (default 0) |
+| phonetic near-misses and partial phrases | the rest |
+
+Shares of empty groups go to the others. Phrases are used round-robin within a group. `negative_test_holdout` (default 0.2) of the generated phrases are used only in `negative_test`, so validation measures near-misses the model has not trained on; custom phrases are used in both splits.
 
 ### Custom Negatives
 
-Additional negative phrases can be specified via `custom_negative_phrases` in the config. These are appended to the auto-generated adversarial phrases before synthesis.
+Additional negative phrases can be specified via `custom_negative_phrases` in the config. They get `custom_negative_share` of the negative clips, however many generated phrases there are.
+
+## Context speech and split phrases
+
+Two optional splits feed the [augmentation](augmentation.md#speech-placement) stage:
+
+- `n_context_samples` > 0 synthesizes `context_speech/`: short generic sentences used as talk before the phrase.
+- `n_split_phrase_samples` / `n_split_phrase_samples_val` > 0 synthesize `positive_train_parts/` and `positive_test_parts/`: each pair of clips (`clip_2j`, `clip_2j+1`) holds the two halves of a target phrase split at a word boundary ("hey" | "computer"), spoken by the same voice. Augmentation joins them with a pause. Multi-word phrases only.
 
 ## Background Noise Clip Generation
 
@@ -162,7 +182,10 @@ output/<model_name>/
 ├── negative_train/      # Adversarial negative training clips (.wav)
 ├── negative_test/       # Adversarial negative validation clips (.wav)
 ├── background_train/    # Background noise training clips (.wav)
-└── background_test/     # Background noise validation clips (.wav)
+├── background_test/     # Background noise validation clips (.wav)
+├── context_speech/      # Optional: speech placed before phrases (n_context_samples)
+├── positive_train_parts/  # Optional: phrase halves (n_split_phrase_samples)
+└── positive_test_parts/   # Optional: phrase halves, held-out voices
 ```
 
 ## Adding a new TTS backend
@@ -180,7 +203,7 @@ Synthetic speech is pluggable so you can swap Piper VITS for another engine (e.g
 - Add a module under [`data/`](../src/livekit/wakeword/data/) (e.g. `data/qwen_tts/`) with a class that satisfies **`SpeechSynthesizer`** in [`tts/backends.py`](../src/livekit/wakeword/data/tts/backends.py):
 
   - **`validate_artifacts()`**: ensure required weights, credentials, or binaries exist; raise `FileNotFoundError` with a clear message if not.
-  - **`synthesize_clips(phrases, output_dir, n_samples, *, start_index, batch_size)`**: write **`clip_%06d.wav`** at **16 kHz**, honoring **`start_index`** for resume the same way Piper does.
+  - **`synthesize_clips(phrases, output_dir, n_samples, *, start_index, batch_size, holdout_voices, voice_group_size)`**: write **`clip_%06d.wav`** at **16 kHz**, honoring **`start_index`** for resume the same way Piper does. Clip *i* uses `phrases[i % len(phrases)]`. `holdout_voices=True` must use only voices reserved for test splits (`split_voices()` in `tts/voices.py`), and `voice_group_size` consecutive clips must share one voice.
 
 - Put **text normalization** and **voice / speaker diversification** inside the backend (not in `run_generate`). Piper uses CMUDict + SLERP; another engine should apply its own diversity strategy so training clips are not single-timbre.
 
