@@ -183,3 +183,12 @@ batch_n_per_class:
   adversarial_negative: 50 # phonetically similar non-wake-words
   ACAV100M_sample: 1024 # random speech from ACAV100M dataset
   background_noise: 50 # pure ambient noise (HVAC, music, etc.)
+
+# Embedding mixup strength (0 disables) and classes kept out of it
+# Suggestion: exclude adversarial_negative so near-misses are never blended into positives
+mixup_alpha: 0.2
+mixup_exclude_classes: []
+
+# Max-pooling streaming loss: extra 80 ms embedding steps of context per example (0 = off)
+# Needs augmentation.clip_duration >= 2.0 + 0.08 * max_pool_steps (e.g. 2.32 for 4)
+max_pool_steps: 0

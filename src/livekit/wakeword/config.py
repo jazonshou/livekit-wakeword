@@ -279,6 +279,16 @@ class WakeWordConfig(BaseModel):
             "background_noise": 50,
         }
     )
+    # Embedding mixup: Beta(alpha, alpha) interpolation of sample pairs. 0 disables it.
+    mixup_alpha: float = 0.2
+    # batch_n_per_class keys kept out of mixup (e.g. ["adversarial_negative"], so near-miss
+    # phrases are never blended into positives and the boundary between them stays sharp).
+    mixup_exclude_classes: list[str] = Field(default_factory=list)
+    # Max-pooling streaming loss: each example carries this many extra embedding steps
+    # (80 ms each) before the classifier's 16, the classifier scores every 16-step window
+    # and the loss uses the highest score. 0 trains on single windows. Needs
+    # augmentation.clip_duration >= 2.0 + 0.08 * max_pool_steps.
+    max_pool_steps: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def _check_negative_shares(self) -> Self:
@@ -297,9 +307,24 @@ class WakeWordConfig(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _check_max_pool_clip_duration(self) -> Self:
+        min_duration = 2.0 + 0.08 * self.max_pool_steps
+        if self.max_pool_steps and self.augmentation.clip_duration < min_duration - 1e-6:
+            raise ValueError(
+                f"max_pool_steps={self.max_pool_steps} needs augmentation.clip_duration >= "
+                f"{min_duration:.2f}s, got {self.augmentation.clip_duration}s"
+            )
+        return self
+
     @property
     def model_output_dir(self) -> Path:
         return Path(self.output_dir) / self.model_name
+
+    @property
+    def feature_steps(self) -> int:
+        """Embedding steps per training example (16 plus any max-pooling context)."""
+        return 16 + self.max_pool_steps
 
     @property
     def data_path(self) -> Path:

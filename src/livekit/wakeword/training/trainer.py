@@ -25,6 +25,9 @@ from .validation import ValidationData, debounce_hops, load_validation_data, sco
 
 logger = logging.getLogger(__name__)
 
+# Embedding steps the classifier takes per window
+N_CLASSIFIER_STEPS = 16
+
 
 class _Checkpoint(TypedDict):
     step: int
@@ -94,6 +97,7 @@ class WakeWordTrainer:
         self.device = device or get_device()
         self.model = WakeWordClassifier(config).to(self.device)
         self.checkpoints: list[_Checkpoint] = []
+        self._class_names: list[str] = []
         self._metrics_log: list[dict[str, object]] = []
         self._metrics_path = config.model_output_dir / f"{config.model_name}_metrics.json"
         self._train_start: float = 0.0
@@ -137,10 +141,14 @@ class WakeWordTrainer:
             "background_noise": lambda _: 0,
         }
 
+        # Class ids yielded with each batch index into this list (data_files order).
+        self._class_names = list(data_files)
         return create_dataloader(
             data_files=data_files,
             n_per_class=self.config.batch_n_per_class,
             label_funcs={k: v for k, v in label_funcs.items() if k in data_files},
+            seq_len=self.config.feature_steps,
+            with_class_ids=True,
         )
 
     def _load_validation_data(self) -> ValidationData:
@@ -154,16 +162,60 @@ class WakeWordTrainer:
             )
         return self._validation_data
 
+    def _score(self, features: torch.Tensor) -> torch.Tensor:
+        """Score (batch, steps, 96) features, returning (batch,) scores.
+
+        Examples longer than the classifier's 16 steps (``max_pool_steps``) are scored on
+        every 16-step window, as a stream would be, and keep their highest score.
+        """
+        window = N_CLASSIFIER_STEPS
+        if features.shape[1] == window:
+            scores: torch.Tensor = self.model(features).squeeze(-1)
+            return scores
+        batch, _, dim = features.shape
+        windows = features.unfold(1, window, 1)  # (batch, n_windows, dim, window)
+        windows = windows.permute(0, 1, 3, 2).reshape(-1, window, dim)
+        window_scores: torch.Tensor = self.model(windows).view(batch, -1)
+        return window_scores.amax(dim=1)
+
+    def _mixup(
+        self, features: torch.Tensor, labels: torch.Tensor, class_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Embedding mixup: blend random pairs of samples and their labels.
+
+        Classes in ``mixup_exclude_classes`` are left as they are and never blended in.
+        """
+        alpha = self.config.mixup_alpha
+        if alpha <= 0:
+            return features, labels
+        excluded = [
+            i
+            for i, name in enumerate(self._class_names)
+            if name in self.config.mixup_exclude_classes
+        ]
+        mixable = ~torch.isin(class_ids, torch.tensor(excluded, device=class_ids.device))
+        idx = torch.nonzero(mixable).squeeze(1)
+        if idx.numel() < 2:
+            return features, labels
+        partner = idx[torch.randperm(idx.numel(), device=idx.device)]
+        lam = torch.distributions.Beta(alpha, alpha).sample().to(features.device)
+        features = features.clone()
+        labels = labels.clone()
+        features[idx] = lam * features[idx] + (1 - lam) * features[partner]
+        labels[idx] = lam * labels[idx] + (1 - lam) * labels[partner]
+        return features, labels
+
     @torch.no_grad()
     def _predict(self, features: np.ndarray, batch_size: int = 512) -> np.ndarray:
         """Run model prediction on numpy features."""
         self.model.eval()
         all_preds: list[np.ndarray] = []
         for i in range(0, len(features), batch_size):
-            batch = torch.from_numpy(features[i : i + batch_size]).to(self.device)
-            preds = self.model(batch).cpu().numpy()
-            all_preds.append(preds)
-        return np.concatenate(all_preds, axis=0).squeeze(-1)
+            batch = torch.from_numpy(features[i : i + batch_size]).float().to(self.device)
+            all_preds.append(self._score(batch).cpu().numpy())
+        if not all_preds:
+            return np.zeros(0, dtype=np.float32)
+        return np.concatenate(all_preds, axis=0)
 
     def _validation_scores(self) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
         """Scores for positive clips, negative clips and every hop of the negative stream."""
@@ -251,30 +303,26 @@ class WakeWordTrainer:
         for step in pbar:
             # Get batch
             try:
-                features, labels = next(data_iter)
+                features, labels, class_ids = next(data_iter)
             except StopIteration:
                 data_iter = iter(dataloader)
-                features, labels = next(data_iter)
+                features, labels, class_ids = next(data_iter)
 
             features = features.to(self.device)
             labels = labels.to(self.device)
+            class_ids = class_ids.to(self.device)
 
             # Embedding mixup: interpolate random pairs of samples and their
             # labels to create virtual training examples. This regularizes in
             # embedding space without touching the audio pipeline.
-            mixup_alpha = 0.2
-            if mixup_alpha > 0:
-                lam = torch.distributions.Beta(mixup_alpha, mixup_alpha).sample().to(self.device)
-                perm = torch.randperm(features.size(0), device=self.device)
-                features = lam * features + (1 - lam) * features[perm]
-                labels = lam * labels + (1 - lam) * labels[perm]
+            features, labels = self._mixup(features, labels, class_ids)
 
             # Label smoothing: 0→ε, 1→1-ε to prevent overconfident predictions
             if label_smoothing > 0:
                 labels = labels * (1 - label_smoothing) + 0.5 * label_smoothing
 
-            # Forward
-            predictions = self.model(features).squeeze(-1)
+            # Forward (max over windows when examples carry max_pool_steps of context)
+            predictions = self._score(features)
 
             # Focal loss replaces BCE + manual hard-example mining.
             # gamma=2.0 automatically down-weights well-classified samples,

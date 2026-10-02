@@ -21,7 +21,18 @@ def _predict_onnx(
     features: np.ndarray,
     batch_size: int = 1,
 ) -> np.ndarray:
-    """Run ONNX model on feature batches, return scores array."""
+    """Run ONNX model on feature batches, return scores array.
+
+    Clips longer than the classifier's 16 steps (``max_pool_steps``) are scored on every
+    16-step window and keep their highest score, as in training.
+    """
+    if features.ndim == 3 and features.shape[1] > 16:
+        n_clips, steps, dim = features.shape
+        windows = np.lib.stride_tricks.sliding_window_view(features, 16, axis=1)
+        windows = windows.transpose(0, 1, 3, 2).reshape(-1, 16, dim)
+        scores = _predict_onnx(session, windows, batch_size)
+        pooled: np.ndarray = scores.reshape(n_clips, steps - 15).max(axis=1)
+        return pooled
     model_input = session.get_inputs()[0]
     input_name = model_input.name
     shape = getattr(model_input, "shape", None)
