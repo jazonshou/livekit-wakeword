@@ -65,6 +65,10 @@ def _edit_distance(a: tuple[str, ...], b: tuple[str, ...], limit: int) -> int:
     return prev[-1]
 
 
+# Shorter words are not varied: any one-phoneme edit still sounds like the word
+MIN_NEIGHBOUR_PHONEMES = 3
+
+
 def phonetic_neighbours(
     word: str,
     max_distance: int | None = None,
@@ -77,6 +81,10 @@ def phonetic_neighbours(
     every word that merely contains ``AH K``. Homophones of *word* and single
     letters are excluded.
 
+    Words under :data:`MIN_NEIGHBOUR_PHONEMES` phonemes get none: one edit to
+    "hey" (``HH EY``) gives "ay", "he" or "heh", which sound like "hey" itself,
+    so training against them teaches the model to reject the wake phrase.
+
     Args:
         word: Lowercase word in CMUDict.
         max_distance: Max phoneme edits (``None`` = 1 for words under 5 phonemes,
@@ -88,6 +96,8 @@ def phonetic_neighbours(
     if not phones:
         return []
     target = _strip_stress(phones)
+    if len(target) < MIN_NEIGHBOUR_PHONEMES:
+        return []
     if max_distance is None:
         max_distance = 1 if len(target) < 5 else 2
 
@@ -178,8 +188,8 @@ def generate_word_swap_phrases(
     """Phrases with one word of each target phrase swapped for a common word.
 
     "hey computer" gives "hey there", "hey siri", "jack computer" ... so the model
-    learns that one half of the phrase is not enough. Swaps that sound like the
-    original word (homophones) or reproduce a target phrase are skipped.
+    learns that one half of the phrase is not enough. Swaps within one phoneme of
+    the original word ("hi" for "hey") or reproducing a target phrase are skipped.
 
     Args:
         target_phrases: Target wake word phrases.
@@ -192,12 +202,16 @@ def generate_word_swap_phrases(
     for phrase in target_phrases:
         orig = phrase.lower().split()
         for idx, word in enumerate(orig):
-            word_pron = cmu.get(word)
+            word_pron = cmu.get(word.strip(",.!?"))
             for swap in vocab:
                 if swap == word:
                     continue
                 swap_pron = cmu.get(swap)
-                if word_pron and swap_pron and _strip_stress(swap_pron) == _strip_stress(word_pron):
+                if (
+                    word_pron
+                    and swap_pron
+                    and _edit_distance(_strip_stress(word_pron), _strip_stress(swap_pron), 1) <= 1
+                ):
                     continue
                 new = orig.copy()
                 new[idx] = swap

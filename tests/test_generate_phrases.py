@@ -45,6 +45,10 @@ class TestPhoneticNeighbours:
         assert len(found) < 200
         assert all(len(_strip_stress(cmu[w])) in (2, 3, 4) for w in found)
 
+    def test_short_words_not_varied(self, cmu: dict[str, list[str]]) -> None:
+        # "ay zuck" or "he zuck" would teach the model to reject "hey zuck"
+        assert phonetic_neighbours("hey", cmu=cmu) == []
+
     def test_unknown_word(self, cmu: dict[str, list[str]]) -> None:
         assert phonetic_neighbours("qzxqzx", cmu=cmu) == []
 
@@ -75,6 +79,10 @@ class TestWordSwap:
         phrases = generate_word_swap_phrases(["hey there"], words=["their", "you"])
         assert "hey their" not in phrases
         assert "hey you" in phrases
+
+    def test_skips_near_homophones(self) -> None:
+        phrases = generate_word_swap_phrases(["hey, zuck"], words=["hi", "jack"])
+        assert phrases == ["hey, hi", "hey, jack", "jack zuck"]  # no "hi zuck"
 
     def test_default_words(self) -> None:
         phrases = generate_word_swap_phrases(["hey zuck"])
