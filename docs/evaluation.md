@@ -207,6 +207,24 @@ streaming_eval:
   snr_db: 10.0
 ```
 
+`positive_speech` takes its preceding speech from the `context_speech` split when it has
+been generated (generic sentences), and from the `negative_test` near-miss clips otherwise.
+Set `streaming_eval.speech_paths` to use other speech, such as real recordings.
+
+To measure the listener's optional checks, set them in `streaming_eval`:
+
+```yaml
+streaming_eval:
+  vad_aggressiveness: 2          # speech gate, 0-3
+  vad_window_seconds: 1.0
+  verifier_model: ./output/hey_zuck_verifier/hey_zuck_verifier.onnx
+  verifier_threshold: 0.5
+  verifier_min_score: 0.1        # verifier runs only at hops scoring at least this
+```
+
+They apply to the audio sets. `validation_stream` is pre-computed features, so it is scored
+without them. DET points below `verifier_min_score` are not verified.
+
 Paths are WAV files or directories (searched recursively; `clip_NNNNNN.wav` originals are
 preferred when present, so augmented copies are skipped).
 

@@ -165,9 +165,40 @@ WakeWordListener(
     model: WakeWordModel | StreamingWakeWordModel,  # loaded classifiers
     threshold: float = 0.5,  # Detection threshold (0-1)
     debounce: float = 2.0,   # Minimum seconds between detections
-    min_consecutive: int = 1 # 80 ms frames in a row a score must reach threshold to fire
+    min_consecutive: int = 1, # 80 ms frames in a row a score must reach threshold to fire
+    vad_aggressiveness: int | None = None,  # 0-3 enables the speech gate
+    vad_window: float = 1.0,       # seconds the speech gate looks back over
+    verifier: WakeWordModel | None = None,  # second-stage model, run only on detections
+    verifier_threshold: float = 0.5,
 )
 ```
+
+#### Speech gate and verifier
+
+Two optional checks sit between the scores and a detection:
+
+- **Speech gate** (`vad_aggressiveness`): WebRTC VAD runs on every 20 ms of audio, and a
+  detection also needs at least 60 ms of speech within the last `vad_window` seconds. Noise
+  that happens to score high (music, clatter) cannot fire. It costs well under 1% of a core.
+- **Verifier** (`verifier`): a second `WakeWordModel` that scores the last 2 s of audio only
+  when the main model fires. Use its classifier with the same name as the detection, or give
+  it a single classifier. Below `verifier_threshold` the detection is dropped and listening
+  continues. Because it runs only on candidates, it can be a larger classifier trained on
+  positives against near-misses (see [training.md](training.md#training-a-verifier)).
+
+```python
+listener = WakeWordListener(
+    WakeWordModel(models=["hey_zuck.onnx"]),
+    threshold=0.5,
+    min_consecutive=2,
+    vad_aggressiveness=2,
+    verifier=WakeWordModel(models=["hey_zuck_verifier.onnx"]),
+    verifier_threshold=0.5,
+)
+```
+
+`livekit-wakeword eval --streaming` applies the same checks when `streaming_eval` sets
+`vad_aggressiveness` or `verifier_model`, so their effect can be measured before deploying.
 
 #### Detection Result
 

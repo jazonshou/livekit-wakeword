@@ -180,6 +180,25 @@ Longer examples need longer clips: set `augmentation.clip_duration` to at least
 loading rejects a shorter clip. The ACAV100M negatives are contiguous, so they are cut into
 blocks of 16 + K steps.
 
+## Training a Verifier
+
+A verifier is a second classifier that the listener runs only when the main model fires
+(see [export-and-inference.md](export-and-inference.md#speech-gate-and-verifier)). It sees
+only candidate detections, so it can be larger and specialise in telling the wake word from
+its near-misses. It uses the same pipeline with a different config:
+
+1. Copy the main config, and change `model_name` (e.g. `hey_zuck_verifier`) and
+   `model.model_size` (e.g. `large`).
+2. Point it at the main model's features instead of generating new data: copy or symlink
+   `positive_features_*.npy`, `negative_features_*.npy` and `background_noise_features_*.npy`
+   from the main model's output directory into the verifier's.
+3. Weight the batch toward the decision it makes:
+   ```yaml
+   batch_n_per_class: {positive: 100, adversarial_negative: 300, ACAV100M_sample: 256, background_noise: 25}
+   mixup_exclude_classes: [adversarial_negative]
+   ```
+4. Run `train` and `export`, then measure it with `streaming_eval.verifier_model`.
+
 ## Validation
 
 ### Data Sources

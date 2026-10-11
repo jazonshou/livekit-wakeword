@@ -6,10 +6,12 @@ import asyncio
 import concurrent.futures
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
 
+from .gating import SpeechGate, verifier_score
 from .model import WakeWordModel
 from .streaming import StreamingWakeWordModel
 
@@ -57,6 +59,10 @@ class WakeWordListener:
         threshold: float = 0.5,
         debounce: float = 2.0,
         min_consecutive: int = 1,
+        vad_aggressiveness: int | None = None,
+        vad_window: float = 1.0,
+        verifier: WakeWordModel | None = None,
+        verifier_threshold: float = 0.5,
     ):
         """Initialize listener.
 
@@ -68,6 +74,14 @@ class WakeWordListener:
             min_consecutive: Number of consecutive 80 ms frames a model's
                 score must stay at or above ``threshold`` before it fires.
                 The default of 1 fires on the first frame above threshold.
+            vad_aggressiveness: When set (0-3), a detection also needs WebRTC VAD
+                to have heard speech within the last ``vad_window`` seconds.
+            vad_window: Seconds of audio the VAD gate looks back over.
+            verifier: Optional second-stage model, run on the last 2 s of audio only
+                when a detection fires. Its classifier with the detection's name (or
+                its only classifier) must score ``verifier_threshold`` or more, or the
+                detection is dropped.
+            verifier_threshold: Threshold for the verifier's score.
         """
         if min_consecutive < 1:
             raise ValueError(f"min_consecutive must be >= 1, got {min_consecutive}")
@@ -79,6 +93,13 @@ class WakeWordListener:
         self._min_consecutive = min_consecutive
         # Consecutive frames each model has scored at or above threshold
         self._consecutive: dict[str, int] = {}
+        self._gate = (
+            SpeechGate(vad_aggressiveness, vad_window) if vad_aggressiveness is not None else None
+        )
+        self._verifier = verifier
+        self._verifier_threshold = verifier_threshold
+        # Last 2 s of audio, for the verifier
+        self._recent: deque[np.ndarray] = deque(maxlen=CHUNK_FRAMES)
 
         self._stream = None
         self._pa = None
@@ -117,8 +138,7 @@ class WakeWordListener:
         self._listening.set()
         self._done_event.clear()
         self._error = None
-        self._model.reset()
-        self._consecutive.clear()
+        self._reset_state()
         self._detection_queue = asyncio.Queue()
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self._task = asyncio.create_task(self._audio_loop())
@@ -176,6 +196,9 @@ class WakeWordListener:
                     break
 
                 frame = np.frombuffer(data, dtype=np.int16)
+                speech = self._gate.update(frame) if self._gate is not None else True
+                if self._verifier is not None:
+                    self._recent.append(frame)
 
                 # Score the new frame in the executor (empty while warming up)
                 hop_scores = await loop.run_in_executor(
@@ -188,14 +211,20 @@ class WakeWordListener:
 
                 # Check for detections (lightweight, fine on event loop)
                 for scores in hop_scores:
+                    if not speech:
+                        scores = {name: 0.0 for name in scores}
+                    previous_detection_time = self._last_detection_time
                     detection = self._check_scores(scores)
+                    if detection is not None and not await self._verify(detection):
+                        self._last_detection_time = previous_detection_time
+                        self._consecutive[detection.name] = 0
+                        detection = None
                     if detection is not None:
                         # Pause the loop and drop buffered audio so no stale
                         # audio is processed while the consumer handles the
                         # detection.
                         self._listening.clear()
-                        self._model.reset()
-                        self._consecutive.clear()
+                        self._reset_state()
                         await self._detection_queue.put(detection)
                         break  # one detection per iteration
         except asyncio.CancelledError:
@@ -205,6 +234,26 @@ class WakeWordListener:
             self._error = exc
         finally:
             self._done_event.set()
+
+    def _reset_state(self) -> None:
+        self._model.reset()
+        self._consecutive.clear()
+        self._recent.clear()
+        if self._gate is not None:
+            self._gate.reset()
+
+    async def _verify(self, detection: Detection) -> bool:
+        """Run the verifier, if any, on the last 2 s of audio."""
+        if self._verifier is None:
+            return True
+        audio = np.concatenate(list(self._recent))
+        loop = asyncio.get_event_loop()
+        scores = await loop.run_in_executor(self._executor, self._verifier.predict, audio)
+        score = verifier_score(scores, detection.name)
+        if score < self._verifier_threshold:
+            logger.debug("Verifier rejected %s (%.2f)", detection.name, score)
+            return False
+        return True
 
     def _check_scores(self, scores: dict[str, float]) -> Detection | None:
         """Update consecutive counts with one frame's scores; return a detection if one fires."""

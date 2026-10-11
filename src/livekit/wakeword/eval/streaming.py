@@ -227,6 +227,46 @@ def score_audio(scorer: FrameScorer, audio: np.ndarray, model_name: str) -> np.n
     return scores
 
 
+def apply_checks(
+    audio: np.ndarray,
+    scores: np.ndarray,
+    model_name: str,
+    *,
+    gate: Any = None,
+    verifier: Any = None,
+    verifier_threshold: float = 0.5,
+    verifier_min_score: float = 0.1,
+) -> np.ndarray:
+    """Zero the hop scores the listener's VAD gate or verifier would block.
+
+    Mirrors :class:`~livekit.wakeword.inference.listener.WakeWordListener`: the gate
+    is updated with each 80 ms frame before that hop's score is used, and the
+    verifier scores the 2 s of audio ending at the hop. To keep it affordable the
+    verifier only runs at hops scoring ``verifier_min_score`` or more, so DET points
+    below that threshold are not verified.
+    """
+    from ..inference.gating import verifier_score
+
+    out = scores.astype(np.float32, copy=True)
+    padded = np.zeros(out.shape[0] * FRAME_SAMPLES, dtype=np.float32)
+    padded[: min(audio.shape[0], padded.shape[0])] = audio[: padded.shape[0]]
+    if gate is not None:
+        gate.reset()
+        for i in range(out.shape[0]):
+            if not gate.update(padded[i * FRAME_SAMPLES : (i + 1) * FRAME_SAMPLES]):
+                out[i] = 0.0
+    if verifier is not None:
+        window = WINDOW_FRAMES * FRAME_SAMPLES
+        for hop in np.flatnonzero(out >= verifier_min_score).tolist():
+            end = (hop + 1) * FRAME_SAMPLES
+            if end < window:
+                continue
+            v = verifier_score(verifier.predict(padded[end - window : end]), model_name)
+            if v < verifier_threshold:
+                out[hop] = 0.0
+    return out
+
+
 def summarize_stream(
     stream: EvalStream,
     scores: np.ndarray,
@@ -389,6 +429,14 @@ def _plot(
     plt.close(fig)
 
 
+def _default_speech_paths(config: WakeWordConfig) -> list[str]:
+    """Speech for ``speech_before``: generic sentences when generated, else near-misses."""
+    context = config.model_output_dir / "context_speech"
+    if context.is_dir() and _collect_wavs([context], originals_only=True):
+        return [str(context)]
+    return [str(config.model_output_dir / "negative_test")]
+
+
 def run_streaming_eval(
     config: WakeWordConfig,
     model_path: str | Path,
@@ -425,7 +473,7 @@ def run_streaming_eval(
             "No streaming eval sets: generate the test splits or add streaming_eval.sets"
         )
 
-    speech_paths = cfg.speech_paths or [str(config.model_output_dir / "negative_test")]
+    speech_paths = cfg.speech_paths or _default_speech_paths(config)
     speech_clips: list[np.ndarray] = []
     if any(s.speech_before for s in sets):
         speech_files = _collect_wavs(speech_paths, originals_only=True)
@@ -440,6 +488,16 @@ def run_streaming_eval(
             background = np.concatenate([_load_wav(p) for p in bg_files])
 
     frame_scorer, scorer_used = make_scorer(model_path, scorer)
+    gate = None
+    if cfg.vad_aggressiveness is not None:
+        from ..inference.gating import SpeechGate
+
+        gate = SpeechGate(cfg.vad_aggressiveness, cfg.vad_window_seconds)
+    verifier = None
+    if cfg.verifier_model:
+        from ..inference.model import WakeWordModel
+
+        verifier = WakeWordModel(models=[cfg.verifier_model])
     logger.info("Streaming eval of %s with the %s scorer", model_name, scorer_used)
 
     scored: list[tuple[EvalStream, np.ndarray]] = []
@@ -470,7 +528,18 @@ def run_streaming_eval(
             len(files),
             stream.audio.shape[0] / SAMPLE_RATE / 60,
         )
-        scored.append((stream, score_audio(frame_scorer, stream.audio, model_name)))
+        scores = score_audio(frame_scorer, stream.audio, model_name)
+        if gate is not None or verifier is not None:
+            scores = apply_checks(
+                stream.audio,
+                scores,
+                model_name,
+                gate=gate,
+                verifier=verifier,
+                verifier_threshold=cfg.verifier_threshold,
+                verifier_min_score=cfg.verifier_min_score,
+            )
+        scored.append((stream, scores))
 
     val = _stream_from_validation_features(config)
     if val is not None:
@@ -500,6 +569,9 @@ def run_streaming_eval(
         "scorer": scorer_used,
         "debounce_seconds": cfg.debounce_seconds,
         "min_consecutive": cfg.min_consecutive,
+        "vad_aggressiveness": cfg.vad_aggressiveness,
+        "verifier_model": cfg.verifier_model,
+        "verifier_threshold": cfg.verifier_threshold if cfg.verifier_model else None,
         "target_fa_per_hour": cfg.target_fa_per_hour,
         "selected_threshold": chosen["threshold"],
         "target_met": target_met,

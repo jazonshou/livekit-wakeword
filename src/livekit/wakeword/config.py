@@ -178,6 +178,14 @@ class StreamingEvalConfig(BaseModel):
     background_paths: list[str] = Field(default_factory=list)
     snr_db: float = 10.0
     seed: int = 0
+    # Optional checks on detections, as in WakeWordListener (audio sets only; the
+    # validation_stream set is features and is scored without them)
+    vad_aggressiveness: int | None = Field(default=None, ge=0, le=3)
+    vad_window_seconds: float = 1.0
+    # Second-stage ONNX classifier run on the last 2 s at hops scoring >= verifier_min_score
+    verifier_model: str | None = None
+    verifier_threshold: float = 0.5
+    verifier_min_score: float = 0.1
 
 
 class WakeWordConfig(BaseModel):

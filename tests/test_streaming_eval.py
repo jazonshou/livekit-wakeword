@@ -262,3 +262,59 @@ def test_trainer_validation_counts_every_hop(sample_config: WakeWordConfig) -> N
     metrics = trainer._validate()
     assert metrics["stream_fpph"] == pytest.approx(2.0)
     assert metrics["recall"] == 1.0
+
+
+class TestApplyChecks:
+    def test_gate_zeroes_hops_without_speech(self) -> None:
+        from livekit.wakeword.eval.streaming import apply_checks
+
+        class _Gate:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def reset(self) -> None:
+                self.calls = 0
+
+            def update(self, frame: np.ndarray) -> bool:
+                self.calls += 1
+                assert frame.shape == (FRAME_SAMPLES,)
+                return self.calls % 2 == 0  # open on every other hop
+
+        scores = np.full(6, 0.9, dtype=np.float32)
+        out = apply_checks(np.zeros(6 * FRAME_SAMPLES), scores, "m", gate=_Gate())
+        assert out.tolist() == pytest.approx([0, 0.9, 0, 0.9, 0, 0.9])
+        assert scores[0] == pytest.approx(0.9)  # input left unchanged
+
+    def test_verifier_runs_on_last_two_seconds_above_min_score(self) -> None:
+        from livekit.wakeword.eval.streaming import apply_checks
+
+        class _Verifier:
+            def __init__(self) -> None:
+                self.ends: list[float] = []
+
+            def predict(self, audio: np.ndarray) -> dict[str, float]:
+                assert audio.shape == (25 * FRAME_SAMPLES,)
+                self.ends.append(float(audio[-1]))
+                return {"m": 0.9 if audio[-1] == 30 else 0.1}
+
+        n = 32
+        audio = np.repeat(np.arange(n, dtype=np.float32), FRAME_SAMPLES)  # value = hop index
+        scores = np.zeros(n, dtype=np.float32)
+        scores[[5, 26, 30]] = 0.8  # hop 5 has < 2 s of audio before it
+        scores[28] = 0.05  # below verifier_min_score: left as is
+        verifier = _Verifier()
+        out = apply_checks(audio, scores, "m", verifier=verifier, verifier_threshold=0.5)
+        assert verifier.ends == [26.0, 30.0]
+        assert out[26] == 0.0 and out[30] == pytest.approx(0.8)
+        assert out[5] == pytest.approx(0.8) and out[28] == pytest.approx(0.05)
+
+
+def test_speech_before_prefers_context_speech(sample_config: WakeWordConfig) -> None:
+    sf = pytest.importorskip("soundfile")
+    from livekit.wakeword.eval.streaming import _default_speech_paths
+
+    out = sample_config.model_output_dir
+    assert _default_speech_paths(sample_config) == [str(out / "negative_test")]
+    (out / "context_speech").mkdir(parents=True)
+    sf.write(str(out / "context_speech" / "clip_000000.wav"), np.zeros(1600), 16000)
+    assert _default_speech_paths(sample_config) == [str(out / "context_speech")]
