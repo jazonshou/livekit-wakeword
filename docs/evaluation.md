@@ -220,13 +220,17 @@ To measure the listener's optional checks, set them in `streaming_eval`:
 streaming_eval:
   vad_aggressiveness: 2          # speech gate, 0-3
   vad_window_seconds: 1.0
-  verifier_model: ./output/hey_zuck_verifier/hey_zuck_verifier.onnx
-  verifier_threshold: 0.5
-  verifier_min_score: 0.1        # verifier runs only at hops scoring at least this
+  verifier_model: ./output/hey_zuck/hey_zuck_verifier.onnx  # from train-verifier
+  verifier_threshold: null       # null: the threshold stored in the verifier model
 ```
 
-They apply to the audio sets. `validation_stream` is pre-computed features, so it is scored
-without them. DET points below `verifier_min_score` are not verified.
+`eval --streaming --verifier PATH [--verifier-threshold T]` does the same from the command
+line. With a verifier, outputs are written as `*_streaming_eval_verified.json` (and
+`_scores_verified.npz`, `_det_verified.png`), so they sit next to the baseline's.
+
+The verifier scores the embeddings of every hop, one classifier call each, so every DET point
+is exact and it also applies to `validation_stream`. The speech gate needs audio, so it
+applies to the audio sets only; `validation_stream` is pre-computed features.
 
 Paths are WAV files or directories (searched recursively; `clip_NNNNNN.wav` originals are
 preferred when present, so augmented copies are skipped).

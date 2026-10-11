@@ -311,6 +311,27 @@ def train(
     logger.info(f"Training complete! Model saved to {model_path}")
 
 
+@app.command("train-verifier")
+def train_verifier(
+    config_path: str = typer.Argument(..., help="Path to wake word config YAML"),
+) -> None:
+    """Train the second-stage verifier (positives vs near misses) and export it to ONNX.
+
+    Needs the features from augment/extraction. Writes <model_name>_verifier.onnx with
+    its threshold stored in the model; load it with WakeWordVerifier.
+    """
+    config = load_config(config_path)
+    v = config.verifier
+    logger.info(f"Training verifier for '{config.model_name}'...")
+    logger.info(f"Model: {v.model.model_type.value} ({v.model.model_size.value})")
+    logger.info(f"Steps: {v.steps}")
+
+    from .training.verifier import run_train_verifier
+
+    onnx_path = run_train_verifier(config)
+    logger.info(f"Verifier complete! Model at {onnx_path}")
+
+
 @app.command()
 def export(
     config_path: str = typer.Argument(..., help="Path to wake word config YAML"),
@@ -353,6 +374,16 @@ def eval(
     threshold: float | None = typer.Option(
         None, "--threshold", "-t", help="With --streaming: report sets at this threshold"
     ),
+    verifier: str | None = typer.Option(
+        None,
+        "--verifier",
+        help="With --streaming: gate detections with this verifier ONNX model",
+    ),
+    verifier_threshold: float | None = typer.Option(
+        None,
+        "--verifier-threshold",
+        help="With --verifier: override the threshold stored in the verifier model",
+    ),
 ) -> None:
     """Evaluate model on validation set: DET curve, AUT, FPPH, recall."""
     from pathlib import Path
@@ -369,9 +400,17 @@ def eval(
     if streaming:
         from .eval.streaming import run_streaming_eval
 
-        report = run_streaming_eval(config, resolved_model, scorer=scorer, threshold=threshold)
+        report = run_streaming_eval(
+            config,
+            resolved_model,
+            scorer=scorer,
+            threshold=threshold,
+            verifier_path=verifier,
+            verifier_threshold=verifier_threshold,
+        )
         _print_streaming_report(report)
-        json_path = config.model_output_dir / f"{config.model_name}_streaming_eval.json"
+        suffix = "_verified" if report.get("verifier") else ""
+        json_path = config.model_output_dir / f"{config.model_name}_streaming_eval{suffix}.json"
         logger.info(f"Streaming eval: {json_path}")
         return
 

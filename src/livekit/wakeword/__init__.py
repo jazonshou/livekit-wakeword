@@ -3,6 +3,7 @@
 from .inference.listener import Detection, WakeWordListener
 from .inference.model import WakeWordModel
 from .inference.streaming import StreamingWakeWordModel
+from .inference.verifier import WakeWordVerifier
 
 __version__ = "0.1.0"
 
@@ -16,6 +17,7 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     "run_extraction": (".data.features", "run_extraction"),
     "run_generate": (".data.generate", "run_generate"),
     "run_train": (".training.trainer", "run_train"),
+    "run_train_verifier": (".training.verifier", "run_train_verifier"),
     "run_export": (".export.onnx", "run_export"),
     "run_eval": (".eval.evaluate", "run_eval"),
 }
@@ -37,6 +39,7 @@ __all__ = [
     "StreamingWakeWordModel",
     "WakeWordListener",
     "WakeWordModel",
+    "WakeWordVerifier",
     "Detection",
     "load_config",
     "run_augment",
@@ -45,5 +48,6 @@ __all__ = [
     "run_extraction",
     "run_generate",
     "run_train",
+    "run_train_verifier",
     "__version__",
 ]

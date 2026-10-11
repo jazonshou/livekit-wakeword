@@ -41,6 +41,11 @@ class FakeModel:
         self._frames = 0
         self.reset_count += 1
 
+    def embeddings(self) -> np.ndarray | None:
+        if self._frames < CHUNK_FRAMES:
+            return None
+        return np.zeros((16, 96), dtype=np.float32)
+
     def process(self, audio: np.ndarray) -> list[dict[str, float]]:
         self._frames += 1
         if self._frames < CHUNK_FRAMES:
@@ -368,12 +373,14 @@ async def test_vad_gate_passes_detection_with_speech():
 
 
 class _FakeVerifier:
+    """Stands in for a WakeWordModel used as a verifier."""
+
     def __init__(self, scores: list[float]):
         self.scores = scores
-        self.calls: list[int] = []
+        self.calls: list[tuple[int, ...]] = []
 
-    def predict(self, audio: np.ndarray) -> dict[str, float]:
-        self.calls.append(audio.shape[0])
+    def score_embeddings(self, emb_sequence: np.ndarray) -> dict[str, float]:
+        self.calls.append(emb_sequence.shape)
         return {"verifier": self.scores[len(self.calls) - 1]}
 
 
@@ -394,6 +401,7 @@ async def test_verifier_drops_rejected_detections():
             detection = await asyncio.wait_for(listener.wait_for_detection(), timeout=5.0)
 
     assert model._call_count == 3
-    # Verified on the last 2 s of audio each time
-    assert verifier.calls == [CHUNK_FRAMES * FRAME_SAMPLES] * 2
+    # Verified on the cached embeddings of the last 2 s each time
+    assert verifier.calls == [(16, 96)] * 2
     assert detection.confidence == pytest.approx(0.9)
+    assert detection.verifier_score == pytest.approx(0.8)
