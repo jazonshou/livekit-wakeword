@@ -41,6 +41,11 @@ class FakeModel:
         self._frames = 0
         self.reset_count += 1
 
+    def embeddings(self) -> np.ndarray | None:
+        if self._frames < CHUNK_FRAMES:
+            return None
+        return np.zeros((16, 96), dtype=np.float32)
+
     def process(self, audio: np.ndarray) -> list[dict[str, float]]:
         self._frames += 1
         if self._frames < CHUNK_FRAMES:
@@ -297,3 +302,106 @@ def test_wraps_stateless_model_in_streaming_model():
 
     stream = StreamingWakeWordModel(model)
     assert WakeWordListener(stream)._model is stream
+
+
+# ---------------------------------------------------------------------------
+# VAD gate and verifier
+# ---------------------------------------------------------------------------
+
+
+class _FakeVad:
+    def __init__(self, speech: bool):
+        self.speech = speech
+
+    def is_speech(self, frame: bytes, sample_rate: int) -> bool:
+        assert len(frame) == 320 * 2 and sample_rate == 16000
+        return self.speech
+
+
+def test_speech_gate_window():
+    from livekit.wakeword.inference.gating import SpeechGate
+
+    gate = SpeechGate(aggressiveness=2, window_seconds=0.1, min_speech_frames=2)
+    vad = _FakeVad(speech=True)
+    gate._vad = vad  # type: ignore[assignment]
+    assert not gate.update(np.zeros(320, dtype=np.int16))  # one speech frame
+    assert gate.update(np.zeros(330, dtype=np.float32))  # two, 10 samples pending
+    vad.speech = False
+    assert gate.update(np.zeros(310, dtype=np.int16))  # pending completes a frame
+    assert not gate.update(np.zeros(1280, dtype=np.int16))  # window now all silence
+    gate.reset()
+    assert not gate.is_open
+
+
+def test_speech_gate_rejects_bad_mode():
+    from livekit.wakeword.inference.gating import SpeechGate
+
+    with pytest.raises(ValueError, match="aggressiveness"):
+        SpeechGate(aggressiveness=4)
+
+
+def test_verifier_score_lookup():
+    from livekit.wakeword.inference.gating import verifier_score
+
+    assert verifier_score({"a": 0.2, "b": 0.9}, "b") == 0.9
+    assert verifier_score({"v": 0.7}, "a") == 0.7
+    assert verifier_score({"x": 0.7, "y": 0.8}, "a") == 0.0
+
+
+@pytest.mark.asyncio
+async def test_vad_gate_blocks_detection_without_speech():
+    """Silence never opens the gate, so high scores don't fire."""
+    model = FakeModel(scores_sequence=[{"test": 0.9}] * 200)
+    with _patch_pyaudio(FakeStream()):
+        async with WakeWordListener(
+            model, threshold=0.5, debounce=0.0, vad_aggressiveness=3
+        ) as listener:
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(listener.wait_for_detection(), timeout=0.5)
+    assert model._call_count > 0
+
+
+@pytest.mark.asyncio
+async def test_vad_gate_passes_detection_with_speech():
+    model = FakeModel(scores_sequence=[{"test": 0.9}] * 5)
+    with _patch_pyaudio(FakeStream()):
+        listener = WakeWordListener(model, threshold=0.5, debounce=0.0, vad_aggressiveness=3)
+        listener._gate._vad = _FakeVad(speech=True)  # type: ignore[union-attr]
+        async with listener:
+            detection = await asyncio.wait_for(listener.wait_for_detection(), timeout=5.0)
+    assert detection.name == "test"
+
+
+class _FakeVerifier:
+    """Stands in for a WakeWordModel used as a verifier."""
+
+    def __init__(self, scores: list[float]):
+        self.scores = scores
+        self.calls: list[tuple[int, ...]] = []
+
+    def score_embeddings(self, emb_sequence: np.ndarray) -> dict[str, float]:
+        self.calls.append(emb_sequence.shape)
+        return {"verifier": self.scores[len(self.calls) - 1]}
+
+
+@pytest.mark.asyncio
+async def test_verifier_drops_rejected_detections():
+    """The first candidate is rejected; the next run above threshold is accepted."""
+    high, low = {"test": 0.9}, {"test": 0.1}
+    model = FakeModel(scores_sequence=[high, low, high])
+    verifier = _FakeVerifier([0.2, 0.8])
+    with _patch_pyaudio(FakeStream()):
+        async with WakeWordListener(
+            model,
+            threshold=0.5,
+            debounce=0.0,
+            verifier=verifier,  # type: ignore[arg-type]
+            verifier_threshold=0.5,
+        ) as listener:
+            detection = await asyncio.wait_for(listener.wait_for_detection(), timeout=5.0)
+
+    assert model._call_count == 3
+    # Verified on the cached embeddings of the last 2 s each time
+    assert verifier.calls == [(16, 96)] * 2
+    assert detection.confidence == pytest.approx(0.9)
+    assert detection.verifier_score == pytest.approx(0.8)

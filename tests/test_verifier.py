@@ -39,11 +39,6 @@ class FakeVerifier(WakeWordVerifier):
         return score
 
 
-class EmbeddingFakeModel(FakeModel):
-    def embeddings(self) -> np.ndarray | None:
-        return np.zeros((16, 96), dtype=np.float32)
-
-
 # ---------------------------------------------------------------------------
 # Inference
 # ---------------------------------------------------------------------------
@@ -119,9 +114,9 @@ async def test_listener_without_verifier_is_unchanged():
 
 @pytest.mark.asyncio
 async def test_verifier_rejects_then_accepts():
-    """Rejected triggers don't fire or pause; the next qualifying hop is re-checked."""
+    """Rejected triggers don't fire or pause; the next hop above threshold is re-checked."""
     high = {"test": 0.9}
-    model = EmbeddingFakeModel(scores_sequence=[{"test": 0.1}, high, high, high])
+    model = FakeModel(scores_sequence=[{"test": 0.1}, high, high, high])
     verifier = FakeVerifier([0.2, 0.3, 0.8])
     with _patch_pyaudio(FakeStream()):
         async with WakeWordListener(
@@ -139,7 +134,7 @@ async def test_verifier_rejects_then_accepts():
 
 @pytest.mark.asyncio
 async def test_verifier_only_runs_on_triggers():
-    model = EmbeddingFakeModel(scores_sequence=[{"test": 0.1}] * 10 + [{"test": 0.9}])
+    model = FakeModel(scores_sequence=[{"test": 0.1}] * 10 + [{"test": 0.9}])
     verifier = FakeVerifier([0.9])
     with _patch_pyaudio(FakeStream()):
         async with WakeWordListener(model, threshold=0.5, verifier=verifier) as listener:
@@ -148,23 +143,22 @@ async def test_verifier_only_runs_on_triggers():
 
 
 @pytest.mark.asyncio
-async def test_verifier_mapping_applies_per_model():
-    """A mapping verifies only the models it names; others fire unchecked."""
-    model = EmbeddingFakeModel(scores_sequence=[{"a": 0.9, "b": 0.1}, {"a": 0.1, "b": 0.9}])
-    verifier = FakeVerifier([0.0])
+async def test_stored_threshold_is_the_default():
+    """Without verifier_threshold the listener uses the verifier's own threshold."""
+    model = FakeModel(scores_sequence=[{"test": 0.9}, {"test": 0.9}])
+    verifier = FakeVerifier([0.6, 0.8], threshold=0.7)
     with _patch_pyaudio(FakeStream()):
         async with WakeWordListener(
-            model, threshold=0.5, debounce=0.0, verifier={"a": verifier}
+            model, threshold=0.5, debounce=0.0, verifier=verifier
         ) as listener:
             detection = await asyncio.wait_for(listener.wait_for_detection(), timeout=5.0)
-    assert detection.name == "b"
-    assert detection.verifier_score is None
-    assert verifier.calls == 1
+            assert listener.rejected_triggers == 1
+    assert detection.verifier_score == pytest.approx(0.8)
 
 
 @pytest.mark.asyncio
 async def test_rejection_does_not_start_debounce():
-    model = EmbeddingFakeModel(scores_sequence=[{"test": 0.9}, {"test": 0.9}])
+    model = FakeModel(scores_sequence=[{"test": 0.9}, {"test": 0.9}])
     verifier = FakeVerifier([0.1, 0.9])
     with _patch_pyaudio(FakeStream()):
         async with WakeWordListener(
@@ -238,6 +232,10 @@ def test_train_verifier_end_to_end(sample_config: WakeWordConfig):
     from livekit.wakeword.config import ModelConfig
     from livekit.wakeword.training.verifier import run_train_verifier
 
+    import torch
+
+    torch.manual_seed(0)
+    np.random.seed(0)
     rng = np.random.default_rng(0)
     out = sample_config.model_output_dir
     out.mkdir(parents=True)
@@ -251,7 +249,7 @@ def test_train_verifier_end_to_end(sample_config: WakeWordConfig):
     np.save(out / "negative_features_test.npy", feats(20, -1.0))
 
     sample_config.verifier.model = ModelConfig(model_type="dnn", model_size="tiny")
-    sample_config.verifier.steps = 60
+    sample_config.verifier.steps = 100
     sample_config.verifier.learning_rate = 1e-2
     sample_config.verifier.batch_n_per_class = {"positive": 16, "adversarial_negative": 16}
 

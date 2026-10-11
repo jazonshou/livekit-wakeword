@@ -120,7 +120,7 @@ class WakeWordModel:
         emb_sequence = self.embed(audio_chunk)
         if emb_sequence is None:
             return {name: 0.0 for name in self._classifiers}
-        return self._score_embeddings(emb_sequence)
+        return self.score_embeddings(emb_sequence)
 
     def embed(self, audio_chunk: np.ndarray) -> np.ndarray | None:
         """The ``(16, 96)`` speech embeddings the classifiers see for an audio chunk.
@@ -158,7 +158,7 @@ class WakeWordModel:
         # Use last 16 embeddings
         return np.stack(embeddings[-MIN_EMBEDDINGS:], axis=0)
 
-    def _score_embeddings(self, emb_sequence: np.ndarray) -> dict[str, float]:
+    def score_embeddings(self, emb_sequence: np.ndarray) -> dict[str, float]:
         """Run every loaded classifier on a ``(16, 96)`` embedding sequence."""
         emb_input = emb_sequence[np.newaxis, :, :].astype(np.float32)
 

@@ -266,7 +266,7 @@ def export_verifier(model: nn.Module, output_path: Path, threshold: float) -> Pa
     onnx_model = onnx.load(str(output_path), load_external_data=True)
     del onnx_model.metadata_props[:]
     entry = onnx_model.metadata_props.add()
-    entry.key, entry.value = THRESHOLD_METADATA_KEY, f"{threshold:.6f}"
+    entry.key, entry.value = THRESHOLD_METADATA_KEY, repr(float(threshold))
     onnx.save(onnx_model, str(output_path), save_as_external_data=False)
     external = output_path.with_suffix(".onnx.data")
     if external.exists():

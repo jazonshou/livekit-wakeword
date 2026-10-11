@@ -117,7 +117,10 @@ Feature extraction models (`melspectrogram.onnx`, `embedding_model.onnx`) are bu
 
 ### StreamingWakeWordModel
 
-For a continuous stream, `StreamingWakeWordModel` wraps a `WakeWordModel` and scores every 80 ms hop incrementally. It computes the mel frames of each new hop and one new speech embedding, and keeps the last 16 embeddings, so each hop costs one embedding-model call instead of the 16 that `predict()` makes on a 2 s window (about 5 ms instead of 40 ms per hop on an x86 core).
+`StreamingWakeWordModel` wraps a `WakeWordModel` and scores a continuous stream every 80 ms:
+
+- Each hop computes the new mel frames and **one** new embedding, and keeps the last 16.
+- That is one embedding call per hop instead of 16 (about 5 ms vs 40 ms on an x86 core).
 
 ```python
 from livekit.wakeword import StreamingWakeWordModel, WakeWordModel
@@ -137,7 +140,10 @@ stream.reset()                       # drop buffered audio, e.g. after a detecti
 | `process(audio)` | `list[dict[str, float]]` | Scores for each 80 ms hop the audio completes; empty during the first 2 s after construction or `reset()` |
 | `reset()` | `None` | Drop buffered audio and cached features |
 
-At every hop the scores equal `predict()` on the most recent 2 s of audio, up to float rounding (`tests/test_streaming.py` checks this on every hop). The mel model floors quiet frames at 80 dB below the loudest frame in its input, so when the loudest frame in the 2 s window changes, cached embeddings that touched the floor are recomputed. With a live microphone's noise floor this rarely happens. Several streams can share one `WakeWordModel` and its ONNX sessions.
+- Scores equal `predict()` on the last 2 s at every hop, up to float rounding.
+- When the loudest frame in the window changes, cached embeddings that depend on the mel floor
+  (80 dB below the peak) are recomputed. This is rare with real microphone noise.
+- Several streams can share one `WakeWordModel`.
 
 ### WakeWordListener
 
@@ -165,10 +171,44 @@ WakeWordListener(
     model: WakeWordModel | StreamingWakeWordModel,  # loaded classifiers
     threshold: float = 0.5,  # Detection threshold (0-1)
     debounce: float = 2.0,   # Minimum seconds between detections
-    min_consecutive: int = 1 # 80 ms frames in a row a score must reach threshold to fire
-    verifier: WakeWordVerifier | Mapping[str, WakeWordVerifier] | None = None,  # off by default
+    min_consecutive: int = 1, # 80 ms frames in a row a score must reach threshold to fire
+    vad_aggressiveness: int | None = None,  # 0-3 enables the speech gate
+    vad_window: float = 1.0,       # seconds the speech gate looks back over
+    verifier: WakeWordVerifier | WakeWordModel | None = None,  # second stage, run only on detections
+    verifier_threshold: float | None = None,  # None: the verifier's stored threshold (or 0.5)
 )
 ```
+
+#### Speech gate and verifier
+
+Two optional checks sit between the scores and a detection:
+
+- **Speech gate** (`vad_aggressiveness`): WebRTC VAD runs on every 20 ms of audio, and a
+  detection also needs at least 60 ms of speech within the last `vad_window` seconds. Noise
+  that happens to score high (music, clatter) cannot fire. It costs well under 1% of a core.
+- **Verifier** (`verifier`): a second classifier run once, only when the main model fires,
+  on the same `(16, 96)` embeddings that hop was scored on (`StreamingWakeWordModel.embeddings()`,
+  the last 2 s of audio). That is one classifier call and no feature extraction. Below
+  `verifier_threshold` the detection is dropped, the debounce is not started, the model's
+  `min_consecutive` run starts over, and listening continues; `listener.rejected_triggers`
+  counts rejections and `Detection.verifier_score` reports the score. Pass a
+  `WakeWordVerifier` (see [Second-Stage Verifier](#second-stage-verifier)), whose threshold
+  is stored in the model, or a `WakeWordModel`, whose classifier with the detection's name
+  (or its only classifier) is used.
+
+```python
+listener = WakeWordListener(
+    WakeWordModel(models=["hey_zuck.onnx"]),
+    threshold=0.5,
+    min_consecutive=2,
+    vad_aggressiveness=2,
+    verifier=WakeWordVerifier("hey_zuck_verifier.onnx"),
+)
+```
+
+`livekit-wakeword eval --streaming` applies the same checks when `streaming_eval` sets
+`vad_aggressiveness` or `verifier_model` (or with `--verifier PATH`), so their effect can be
+measured before deploying.
 
 #### Detection Result
 
@@ -183,7 +223,7 @@ class Detection:
 
 ### Second-Stage Verifier
 
-`WakeWordVerifier` is an optional second classifier that confirms or rejects a trigger before it becomes a detection. The always-on model fires first; only then does the listener run the verifier, once, on the same `(16, 96)` embeddings the trigger was scored on (`StreamingWakeWordModel.embeddings()`, the last 2 s of audio). That is one classifier call and no feature extraction, so it costs nothing while idle and little per trigger, and the verifier can be a larger model trained only to separate the wake phrase from its near misses.
+`WakeWordVerifier` loads a verifier classifier (any classifier ONNX taking `(batch, 16, 96)` embeddings). It runs only after the always-on model fires, so it can be a larger model trained only to separate the wake phrase from its near misses, with `livekit-wakeword train-verifier <config>` (see [Training](training.md#second-stage-verifier)).
 
 ```python
 from livekit.wakeword import WakeWordListener, WakeWordModel, WakeWordVerifier
@@ -196,11 +236,9 @@ async with WakeWordListener(model, threshold=0.5, verifier=verifier) as listener
     print(detection.confidence, detection.verifier_score)
 ```
 
-- A single verifier checks every model's triggers; a `{model_name: verifier}` mapping checks only the models it names.
-- A rejected trigger doesn't fire, pause or start the debounce. The next hop that still meets the firing rule is checked again, so a phrase that is better aligned one hop later can still pass. `listener.rejected_triggers` counts rejections.
-- `WakeWordVerifier(path, threshold=None)` uses the threshold stored in the ONNX metadata (`verifier_threshold`) by `train-verifier`, or 0.5 if there is none. `score(embeddings)`, `score_batch(...)`, `verify(...)` and `score_audio(model, audio)` are available outside the listener.
-
-Train one with `livekit-wakeword train-verifier <config>` (see [Training](training.md#second-stage-verifier)) and measure it with `livekit-wakeword eval <config> --streaming --verifier <path>`, which writes `*_streaming_eval_verified.json` next to the baseline report.
+- `WakeWordVerifier(path, threshold=None)` uses the threshold `train-verifier` stored in the ONNX metadata (`verifier_threshold`), or 0.5 if there is none.
+- `score(embeddings)`, `score_batch(...)`, `verify(...)` and `score_audio(model, audio)` work outside the listener; `WakeWordModel.embed(audio)` gives the embeddings for ~2 s of audio.
+- Measure it with `livekit-wakeword eval <config> --streaming --verifier <path>`, which writes `*_streaming_eval_verified.json` next to the baseline report.
 
 #### Lifecycle
 

@@ -121,7 +121,10 @@ The evaluation uses `find_best_threshold()` to scan thresholds from 0.01 to 0.99
 
 All feature arrays have shape `(N, 16, 96)` — N clips × 16 embedding timesteps × 96-dim speech embeddings.
 
-The general negative validation set (`validation_set_features.npy`) is stored as 2D `(N, 96)`, one embedding per 80 ms hop, and is scored over stride-1 windows (see FPPH above).
+The general negative validation set (`validation_set_features.npy`):
+
+- is stored as 2D `(N, 96)`, one embedding per 80 ms hop;
+- is scored over stride-1 windows (see FPPH above).
 
 ### Requirements
 
@@ -206,6 +209,28 @@ streaming_eval:
   background_paths: [./data/demand]
   snr_db: 10.0
 ```
+
+`positive_speech` takes its preceding speech from the `context_speech` split when it has
+been generated (generic sentences), and from the `negative_test` near-miss clips otherwise.
+Set `streaming_eval.speech_paths` to use other speech, such as real recordings.
+
+To measure the listener's optional checks, set them in `streaming_eval`:
+
+```yaml
+streaming_eval:
+  vad_aggressiveness: 2          # speech gate, 0-3
+  vad_window_seconds: 1.0
+  verifier_model: ./output/hey_zuck/hey_zuck_verifier.onnx  # from train-verifier
+  verifier_threshold: null       # null: the threshold stored in the verifier model
+```
+
+`eval --streaming --verifier PATH [--verifier-threshold T]` does the same from the command
+line. With a verifier, outputs are written as `*_streaming_eval_verified.json` (and
+`_scores_verified.npz`, `_det_verified.png`), so they sit next to the baseline's.
+
+The verifier scores the embeddings of every hop, one classifier call each, so every DET point
+is exact and it also applies to `validation_stream`. The speech gate needs audio, so it
+applies to the audio sets only; `validation_stream` is pre-computed features.
 
 Paths are WAV files or directories (searched recursively; `clip_NNNNNN.wav` originals are
 preferred when present, so augmented copies are skipped).

@@ -409,7 +409,7 @@ def eval(
             verifier_threshold=verifier_threshold,
         )
         _print_streaming_report(report)
-        suffix = "_verified" if verifier else ""
+        suffix = "_verified" if report.get("verifier") else ""
         json_path = config.model_output_dir / f"{config.model_name}_streaming_eval{suffix}.json"
         logger.info(f"Streaming eval: {json_path}")
         return

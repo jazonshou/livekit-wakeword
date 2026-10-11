@@ -131,7 +131,7 @@ class StreamingWakeWordModel:
             if cached.floor != floor and cached.min_mel < max(cached.floor, floor):
                 self._embeddings[i] = self._embed(cached.position, mel_start, floor)
 
-        return self._model._score_embeddings(np.stack([e.vector for e in self._embeddings]))
+        return self._model.score_embeddings(np.stack([e.vector for e in self._embeddings]))
 
     def _append_mel(self, audio: np.ndarray) -> None:
         """Compute every complete mel frame in ``audio`` (which starts at frame ``_n_mel``).

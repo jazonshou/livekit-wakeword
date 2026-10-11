@@ -184,7 +184,7 @@ blocks of 16 + K steps.
 
 **Source:** `src/livekit/wakeword/training/verifier.py`, CLI `livekit-wakeword train-verifier <config>`
 
-Trains the optional `WakeWordVerifier` that the listener runs only after the always-on model fires. It reuses the features `augment` already extracted, so it needs no new data:
+Trains the optional `WakeWordVerifier` that the listener runs only after the always-on model fires (see [export-and-inference.md](export-and-inference.md#speech-gate-and-verifier)). It sees only candidate detections, so it can be larger and specialise in telling the wake word from its near misses. It reuses the features `augment` already extracted for the main model, so it needs no new data or second config:
 
 - **Classes** (`verifier.batch_n_per_class`): `positive` (128) against `adversarial_negative` near misses (256), plus a little `ACAV100M_sample` general speech (64) and optionally `background_noise` (0). Missing optional files are skipped.
 - **Model** (`verifier.model`): `conv_attention` `medium` by default; it runs once per trigger, so it can be larger than the always-on head.
@@ -199,6 +199,8 @@ verifier:
   batch_n_per_class: {positive: 128, adversarial_negative: 256, ACAV100M_sample: 64}
   target_recall: 0.98
 ```
+
+Measure it with `livekit-wakeword eval <config> --streaming --verifier <model_dir>/<model_name>_verifier.onnx` (or `streaming_eval.verifier_model`).
 
 ## Validation
 

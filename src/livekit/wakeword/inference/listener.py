@@ -6,11 +6,11 @@ import asyncio
 import concurrent.futures
 import logging
 import time
-from collections.abc import Mapping
 from dataclasses import dataclass
 
 import numpy as np
 
+from .gating import SpeechGate, verifier_score
 from .model import WakeWordModel
 from .streaming import StreamingWakeWordModel
 from .verifier import WakeWordVerifier
@@ -44,11 +44,6 @@ class WakeWordListener:
     the loop pauses automatically, drops the buffered audio, and resumes when
     the consumer calls ``wait_for_detection()`` again.
 
-    With a ``verifier``, a trigger from the always-on model becomes a
-    detection only if the verifier, run once on the same 2 s of embeddings,
-    accepts it.  Rejected triggers are dropped without pausing, and the next
-    hop that still meets the firing rule is checked again.
-
     Example:
         from livekit.wakeword import WakeWordModel, WakeWordListener
 
@@ -66,7 +61,10 @@ class WakeWordListener:
         threshold: float = 0.5,
         debounce: float = 2.0,
         min_consecutive: int = 1,
-        verifier: WakeWordVerifier | Mapping[str, WakeWordVerifier] | None = None,
+        vad_aggressiveness: int | None = None,
+        vad_window: float = 1.0,
+        verifier: WakeWordVerifier | WakeWordModel | None = None,
+        verifier_threshold: float | None = None,
     ):
         """Initialize listener.
 
@@ -78,9 +76,19 @@ class WakeWordListener:
             min_consecutive: Number of consecutive 80 ms frames a model's
                 score must stay at or above ``threshold`` before it fires.
                 The default of 1 fires on the first frame above threshold.
-            verifier: Optional second-stage check (off by default).  A single
-                ``WakeWordVerifier`` checks every model's triggers; a mapping
-                from model name to verifier checks only the models it names.
+            vad_aggressiveness: When set (0-3), a detection also needs WebRTC VAD
+                to have heard speech within the last ``vad_window`` seconds.
+            vad_window: Seconds of audio the VAD gate looks back over.
+            verifier: Optional second-stage model, run once on the last 2 s only
+                when a detection fires. It scores the embeddings the stream already
+                cached for that hop, so it costs one classifier call. A
+                ``WakeWordVerifier`` (e.g. from ``train-verifier``) checks every
+                model; for a ``WakeWordModel`` its classifier with the detection's
+                name (or its only classifier) is used. A detection scoring below
+                ``verifier_threshold`` is dropped.
+            verifier_threshold: Threshold for the verifier's score. None uses the
+                ``WakeWordVerifier``'s own threshold (stored by ``train-verifier``),
+                or 0.5 for a ``WakeWordModel``.
         """
         if min_consecutive < 1:
             raise ValueError(f"min_consecutive must be >= 1, got {min_consecutive}")
@@ -90,11 +98,19 @@ class WakeWordListener:
         self._threshold = threshold
         self._debounce = debounce
         self._min_consecutive = min_consecutive
-        self._verifier = verifier
-        # Triggers the verifier has rejected since the listener started
-        self.rejected_triggers = 0
         # Consecutive frames each model has scored at or above threshold
         self._consecutive: dict[str, int] = {}
+        self._gate = (
+            SpeechGate(vad_aggressiveness, vad_window) if vad_aggressiveness is not None else None
+        )
+        self._verifier = verifier
+        if verifier_threshold is None:
+            verifier_threshold = (
+                verifier.threshold if isinstance(verifier, WakeWordVerifier) else 0.5
+            )
+        self._verifier_threshold = verifier_threshold
+        # Detections the verifier has rejected since the listener started
+        self.rejected_triggers = 0
 
         self._stream = None
         self._pa = None
@@ -133,8 +149,7 @@ class WakeWordListener:
         self._listening.set()
         self._done_event.clear()
         self._error = None
-        self._model.reset()
-        self._consecutive.clear()
+        self._reset_state()
         self.rejected_triggers = 0
         self._detection_queue = asyncio.Queue()
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -193,6 +208,7 @@ class WakeWordListener:
                     break
 
                 frame = np.frombuffer(data, dtype=np.int16)
+                speech = self._gate.update(frame) if self._gate is not None else True
 
                 # Score the new frame in the executor (empty while warming up)
                 hop_scores = await loop.run_in_executor(
@@ -204,46 +220,34 @@ class WakeWordListener:
                     break
 
                 # Check for detections (lightweight, fine on event loop)
-                detection = None
                 for scores in hop_scores:
-                    for name, score in self._candidates(scores):
-                        verifier = self._verifier_for(name)
-                        verifier_score = None
-                        if verifier is not None:
-                            # One classifier call on the cached embeddings
-                            accepted, verifier_score = await loop.run_in_executor(
-                                self._executor, self._verify, verifier
-                            )
-                            if not accepted:
-                                self.rejected_triggers += 1
-                                logger.info(
-                                    "Verifier rejected '%s' trigger (score %.2f, verifier %.2f)",
-                                    name,
-                                    score,
-                                    verifier_score,
-                                )
-                                continue
-                        now = time.monotonic()
-                        self._last_detection_time = now
-                        detection = Detection(
-                            name=name,
-                            confidence=score,
-                            timestamp=now,
-                            verifier_score=verifier_score,
+                    if not speech:
+                        scores = {name: 0.0 for name in scores}
+                    previous_detection_time = self._last_detection_time
+                    detection = self._check_scores(scores)
+                    if detection is not None and self._verifier is not None:
+                        detection.verifier_score = await loop.run_in_executor(
+                            self._executor, self._verify, detection.name
                         )
-                        break
+                        if detection.verifier_score < self._verifier_threshold:
+                            logger.info(
+                                "Verifier rejected '%s' (score %.2f, verifier %.2f)",
+                                detection.name,
+                                detection.confidence,
+                                detection.verifier_score,
+                            )
+                            self.rejected_triggers += 1
+                            self._last_detection_time = previous_detection_time
+                            self._consecutive[detection.name] = 0
+                            detection = None
                     if detection is not None:
-                        break
-                if not self._running:
-                    break
-                if detection is not None:
-                    # Pause the loop and drop buffered audio so no stale
-                    # audio is processed while the consumer handles the
-                    # detection.
-                    self._listening.clear()
-                    self._model.reset()
-                    self._consecutive.clear()
-                    await self._detection_queue.put(detection)
+                        # Pause the loop and drop buffered audio so no stale
+                        # audio is processed while the consumer handles the
+                        # detection.
+                        self._listening.clear()
+                        self._reset_state()
+                        await self._detection_queue.put(detection)
+                        break  # one detection per iteration
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -252,28 +256,36 @@ class WakeWordListener:
         finally:
             self._done_event.set()
 
-    def _candidates(self, scores: dict[str, float]) -> list[tuple[str, float]]:
-        """Update consecutive counts with one frame's scores; return the models that fire."""
+    def _reset_state(self) -> None:
+        self._model.reset()
+        self._consecutive.clear()
+        if self._gate is not None:
+            self._gate.reset()
+
+    def _verify(self, name: str) -> float:
+        """Score the verifier on the embeddings the latest hop was scored on."""
+        embeddings = self._model.embeddings()
+        if embeddings is None or self._verifier is None:
+            return 0.0
+        if isinstance(self._verifier, WakeWordVerifier):
+            return self._verifier.score(embeddings)
+        return verifier_score(self._verifier.score_embeddings(embeddings), name)
+
+    def _check_scores(self, scores: dict[str, float]) -> Detection | None:
+        """Update consecutive counts with one frame's scores; return a detection if one fires."""
         now = time.monotonic()
-        fired = []
+        detection = None
         for name, score in scores.items():
             count = self._consecutive.get(name, 0) + 1 if score >= self._threshold else 0
             self._consecutive[name] = count
-            if count >= self._min_consecutive and now - self._last_detection_time >= self._debounce:
-                fired.append((name, score))
-        return fired
-
-    def _verifier_for(self, name: str) -> WakeWordVerifier | None:
-        if self._verifier is None or isinstance(self._verifier, WakeWordVerifier):
-            return self._verifier
-        return self._verifier.get(name)
-
-    def _verify(self, verifier: WakeWordVerifier) -> tuple[bool, float]:
-        """Run the verifier on the embeddings the latest hop was scored on."""
-        embeddings = self._model.embeddings()
-        if embeddings is None:
-            return False, 0.0
-        return verifier.verify(embeddings)
+            if (
+                detection is None
+                and count >= self._min_consecutive
+                and now - self._last_detection_time >= self._debounce
+            ):
+                self._last_detection_time = now
+                detection = Detection(name=name, confidence=score, timestamp=now)
+        return detection
 
     async def wait_for_detection(self) -> Detection:
         """Wait for and return the next wake word detection.

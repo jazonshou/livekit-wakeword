@@ -211,6 +211,15 @@ class StreamingEvalConfig(BaseModel):
     background_paths: list[str] = Field(default_factory=list)
     snr_db: float = 10.0
     seed: int = 0
+    # Optional checks on detections, as in WakeWordListener. The VAD gate applies to
+    # audio sets only (validation_stream is features); the verifier applies to all.
+    vad_aggressiveness: int | None = Field(default=None, ge=0, le=3)
+    vad_window_seconds: float = 1.0
+    # Second-stage verifier ONNX model (e.g. from train-verifier) gating every hop, as
+    # WakeWordListener(verifier=...) does; also set by `eval --streaming --verifier`.
+    verifier_model: str | None = None
+    # None uses the threshold stored in the verifier model (0.5 if it has none)
+    verifier_threshold: float | None = None
 
 
 class WakeWordConfig(BaseModel):

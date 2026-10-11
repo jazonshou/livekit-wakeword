@@ -121,6 +121,9 @@ class _LoudnessScorer:
     def process_frame(self, frame: np.ndarray) -> dict[str, float]:
         return {"m": float(np.abs(frame).mean() > 0.3)}
 
+    def embeddings(self) -> np.ndarray | None:
+        return np.zeros((16, 96), dtype=np.float32)
+
 
 class TestStreams:
     def test_layout(self) -> None:
@@ -262,3 +265,67 @@ def test_trainer_validation_counts_every_hop(sample_config: WakeWordConfig) -> N
     metrics = trainer._validate()
     assert metrics["stream_fpph"] == pytest.approx(2.0)
     assert metrics["recall"] == 1.0
+
+
+class TestApplyChecks:
+    def test_gate_zeroes_hops_without_speech(self) -> None:
+        from livekit.wakeword.eval.streaming import apply_checks
+
+        class _Gate:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def reset(self) -> None:
+                self.calls = 0
+
+            def update(self, frame: np.ndarray) -> bool:
+                self.calls += 1
+                assert frame.shape == (FRAME_SAMPLES,)
+                return self.calls % 2 == 0  # open on every other hop
+
+        scores = np.full(6, 0.9, dtype=np.float32)
+        out = apply_checks(np.zeros(6 * FRAME_SAMPLES), scores, gate=_Gate())
+        assert out.tolist() == pytest.approx([0, 0.9, 0, 0.9, 0, 0.9])
+        assert scores[0] == pytest.approx(0.9)  # input left unchanged
+
+
+def test_speech_before_prefers_context_speech(sample_config: WakeWordConfig) -> None:
+    sf = pytest.importorskip("soundfile")
+    from livekit.wakeword.eval.streaming import _default_speech_paths
+
+    out = sample_config.model_output_dir
+    assert _default_speech_paths(sample_config) == [str(out / "negative_test")]
+    (out / "context_speech").mkdir(parents=True)
+    sf.write(str(out / "context_speech" / "clip_000000.wav"), np.zeros(1600), 16000)
+    assert _default_speech_paths(sample_config) == [str(out / "context_speech")]
+
+
+def test_run_streaming_eval_with_verifier(
+    sample_config: WakeWordConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A verifier that rejects everything removes every detection; outputs get _verified."""
+    sf = pytest.importorskip("soundfile")
+    out = sample_config.model_output_dir
+    (out / "positive_test").mkdir(parents=True)
+    for i in range(3):
+        sf.write(str(out / "positive_test" / f"clip_{i:06d}.wav"), _clip(1.0, 0.5), SAMPLE_RATE)
+    model_path = out / "m.onnx"
+    model_path.write_bytes(b"")
+    monkeypatch.setattr(streaming, "make_scorer", lambda *_a, **_k: (_LoudnessScorer(), "test"))
+    verifier = Path(__file__).parent.parent / "examples" / "resources" / "hey_livekit.onnx"
+
+    sample_config.streaming_eval = StreamingEvalConfig(
+        target_fa_per_hour=1e9, verifier_model=str(verifier), verifier_threshold=1.01
+    )
+    report = streaming.run_streaming_eval(sample_config, model_path)
+    assert report["verifier"] == "hey_livekit"
+    assert report["verifier_threshold"] == pytest.approx(1.01)
+    assert report["sets"]["positive_silence"]["miss_rate"] == 1.0
+    assert (out / "test_wakeword_streaming_eval_verified.json").exists()
+    assert not (out / "test_wakeword_streaming_eval.json").exists()
+
+    # The CLI option overrides the config; threshold 0 accepts every hop
+    report = streaming.run_streaming_eval(
+        sample_config, model_path, verifier_path=verifier, verifier_threshold=0.0
+    )
+    assert report["sets"]["positive_silence"]["miss_rate"] == 0.0
