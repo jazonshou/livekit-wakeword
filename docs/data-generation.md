@@ -132,6 +132,8 @@ Only leading and trailing silence is trimmed:
      - CMUDict words one phoneme edit away (two for words of 5+ phonemes), stress ignored.
      - For "zuck" (`Z AH K`): duck, luck, zach, zucker, ...
      - Homophones are excluded.
+     - Words under 3 phonemes are not varied: one edit to "hey" gives "ay" or "he", which
+       sound like "hey", so training against them teaches the model to reject the phrase.
    - With probability `include_partial_phrase` (default 1.0), add every partial phrase (each word
      removed in turn), so neither half of the phrase alone counts as a positive
    - Include individual words with probability `include_input_words` (default: 0.2)
@@ -146,6 +148,7 @@ Word swaps (when `word_swap_share > 0`):
 - `generate_word_swap_phrases()` swaps each word of the phrase for common words and names.
 - The words come from `word_swap_words`, by default a built-in list ("hey there", "hey siri",
   "jack computer", ...).
+- Swaps within one phoneme of the original word ("hi" for "hey") are skipped.
 
 ### Phrase mix and held-out phrases
 
