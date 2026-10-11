@@ -71,7 +71,11 @@ In every round, each clip is fitted to the target window (default 2.0 seconds = 
 
 `align_clip_to_end(audio, target_length, jitter_samples=3200)`
 
-Positive and negative clips are both placed at the **end** of the window with random jitter of up to `augmentation.end_jitter` seconds (default 0.3 s; the function's own default is 200 ms). Clips longer than the window keep their end. This simulates the real detection scenario where the wake word appears at the trailing edge of the audio buffer.
+Positive and negative clips are both placed at the **end** of the window:
+
+- The clip ends up to `augmentation.end_jitter` seconds (default 0.3 s) before the window end.
+- Clips longer than the window keep their end.
+- This matches live detection, where the wake word sits at the trailing edge of the buffer.
 
 ```
 [    padding    |  phrase  | jitter ]
@@ -82,7 +86,7 @@ The padding is zero only until background mixing, which then fills the whole win
 
 ### Speech placement
 
-`SpeechPlacement` (built per split by `build_placement()`) can fill the padding with speech, so the model also sees the phrase right after talk, as a live stream does. All of it is off by default:
+`SpeechPlacement` can fill the padding with speech, so the model also sees the phrase right after talk. All options are off by default:
 
 | Field (`augmentation.`) | Effect |
 |-------|--------|
@@ -110,7 +114,9 @@ Live audio never contains digital silence, and `WakeWordListener` slides a 2 s w
 
 The augmentation pipeline runs `config.augmentation.rounds` passes over all six directories (positive train/test, negative train/test, background train/test). Each round writes to a separate file (`clip_000000_r0.wav`, `clip_000000_r1.wav`, etc.) — originals are never modified.
 
-Every round reads the clean TTS originals and draws a new placement, jitter, context, RIR and noise, so `rounds: 3` gives three independent variants of each clip. (Rounds used to stack, each reading the previous round's output, which kept the clip in the same position and piled up to three reverbs and three layers of noise.) Old augmented files (`_rN.wav`) are cleaned up at the start of each run so re-running is idempotent.
+- Every round reads the clean TTS originals.
+- Each round draws a new placement, jitter, context, RIR and noise, so `rounds: 3` gives three independent variants of each clip.
+- Old augmented files (`_rN.wav`) are deleted at the start of each run, so re-running is safe.
 
 ## Per-Clip Processing Order
 

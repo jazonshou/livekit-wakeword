@@ -117,7 +117,10 @@ Feature extraction models (`melspectrogram.onnx`, `embedding_model.onnx`) are bu
 
 ### StreamingWakeWordModel
 
-For a continuous stream, `StreamingWakeWordModel` wraps a `WakeWordModel` and scores every 80 ms hop incrementally. It computes the mel frames of each new hop and one new speech embedding, and keeps the last 16 embeddings, so each hop costs one embedding-model call instead of the 16 that `predict()` makes on a 2 s window (about 5 ms instead of 40 ms per hop on an x86 core).
+`StreamingWakeWordModel` wraps a `WakeWordModel` and scores a continuous stream every 80 ms:
+
+- Each hop computes the new mel frames and **one** new embedding, and keeps the last 16.
+- That is one embedding call per hop instead of 16 (about 5 ms vs 40 ms on an x86 core).
 
 ```python
 from livekit.wakeword import StreamingWakeWordModel, WakeWordModel
@@ -137,7 +140,10 @@ stream.reset()                       # drop buffered audio, e.g. after a detecti
 | `process(audio)` | `list[dict[str, float]]` | Scores for each 80 ms hop the audio completes; empty during the first 2 s after construction or `reset()` |
 | `reset()` | `None` | Drop buffered audio and cached features |
 
-At every hop the scores equal `predict()` on the most recent 2 s of audio, up to float rounding (`tests/test_streaming.py` checks this on every hop). The mel model floors quiet frames at 80 dB below the loudest frame in its input, so when the loudest frame in the 2 s window changes, cached embeddings that touched the floor are recomputed. With a live microphone's noise floor this rarely happens. Several streams can share one `WakeWordModel` and its ONNX sessions.
+- Scores equal `predict()` on the last 2 s at every hop, up to float rounding.
+- When the loudest frame in the window changes, cached embeddings that depend on the mel floor
+  (80 dB below the peak) are recomputed. This is rare with real microphone noise.
+- Several streams can share one `WakeWordModel`.
 
 ### WakeWordListener
 

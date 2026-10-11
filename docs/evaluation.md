@@ -121,7 +121,10 @@ The evaluation uses `find_best_threshold()` to scan thresholds from 0.01 to 0.99
 
 All feature arrays have shape `(N, 16, 96)` — N clips × 16 embedding timesteps × 96-dim speech embeddings.
 
-The general negative validation set (`validation_set_features.npy`) is stored as 2D `(N, 96)`, one embedding per 80 ms hop, and is scored over stride-1 windows (see FPPH above).
+The general negative validation set (`validation_set_features.npy`):
+
+- is stored as 2D `(N, 96)`, one embedding per 80 ms hop;
+- is scored over stride-1 windows (see FPPH above).
 
 ### Requirements
 
