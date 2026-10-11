@@ -75,6 +75,17 @@ class StreamingWakeWordModel:
         self._mel = np.zeros((0, 32), dtype=np.float32)
         self._embeddings: deque[_CachedEmbedding] = deque(maxlen=MIN_EMBEDDINGS)
 
+    def embeddings(self) -> np.ndarray | None:
+        """The ``(16, 96)`` embedding sequence the latest hop was scored on.
+
+        Returns None while the stream is warming up.  A second-stage
+        verifier can score this directly, so checking a trigger costs one
+        classifier call and no feature extraction.
+        """
+        if self._n_samples < WINDOW_SAMPLES or len(self._embeddings) < MIN_EMBEDDINGS:
+            return None
+        return np.stack([e.vector for e in self._embeddings])
+
     def process(self, audio: np.ndarray) -> list[dict[str, float]]:
         """Feed audio and score every hop it completes.
 
@@ -120,7 +131,7 @@ class StreamingWakeWordModel:
             if cached.floor != floor and cached.min_mel < max(cached.floor, floor):
                 self._embeddings[i] = self._embed(cached.position, mel_start, floor)
 
-        return self._model._score_embeddings(np.stack([e.vector for e in self._embeddings]))
+        return self._model.score_embeddings(np.stack([e.vector for e in self._embeddings]))
 
     def _append_mel(self, audio: np.ndarray) -> None:
         """Compute every complete mel frame in ``audio`` (which starts at frame ``_n_mel``).

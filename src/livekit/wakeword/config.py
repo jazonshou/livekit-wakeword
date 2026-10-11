@@ -145,6 +145,38 @@ class VoxCpmTtsConfig(BaseModel):
     )
 
 
+class VerifierConfig(BaseModel):
+    """Second-stage verifier (``train-verifier``): a classifier that re-checks triggers.
+
+    It runs only after the always-on model fires, so it can be larger, and it is
+    trained mostly on positives against near-miss (adversarial) negatives.
+    """
+
+    model: ModelConfig = Field(
+        default_factory=lambda: ModelConfig(
+            model_type=ModelType.conv_attention, model_size=ModelSize.medium
+        )
+    )
+    steps: int = Field(default=20000, ge=1)
+    learning_rate: float = 1e-4
+    weight_decay: float = 1e-2
+    # Examples per class in each batch. ACAV100M_sample and background_noise are optional
+    # (0 drops them); a little general speech keeps the verifier sane on odd triggers.
+    batch_n_per_class: dict[str, int] = Field(
+        default_factory=lambda: {
+            "positive": 128,
+            "adversarial_negative": 256,
+            "ACAV100M_sample": 64,
+            "background_noise": 0,
+        }
+    )
+    # Threshold selection on the test splits: the highest threshold that keeps at least
+    # this share of positive_test clips. It is stored in the exported ONNX model.
+    target_recall: float = Field(default=0.98, gt=0.0, le=1.0)
+    # Checkpoints averaged into the final model (best near-miss rejection at target_recall)
+    n_average: int = Field(default=3, ge=1)
+
+
 class StreamingEvalSet(BaseModel):
     """A labelled set of clips (or long recordings) replayed as one audio stream."""
 
@@ -178,14 +210,15 @@ class StreamingEvalConfig(BaseModel):
     background_paths: list[str] = Field(default_factory=list)
     snr_db: float = 10.0
     seed: int = 0
-    # Optional checks on detections, as in WakeWordListener (audio sets only; the
-    # validation_stream set is features and is scored without them)
+    # Optional checks on detections, as in WakeWordListener. The VAD gate applies to
+    # audio sets only (validation_stream is features); the verifier applies to all.
     vad_aggressiveness: int | None = Field(default=None, ge=0, le=3)
     vad_window_seconds: float = 1.0
-    # Second-stage ONNX classifier run on the last 2 s at hops scoring >= verifier_min_score
+    # Second-stage verifier ONNX model (e.g. from train-verifier) gating every hop, as
+    # WakeWordListener(verifier=...) does; also set by `eval --streaming --verifier`.
     verifier_model: str | None = None
-    verifier_threshold: float = 0.5
-    verifier_min_score: float = 0.1
+    # None uses the threshold stored in the verifier model (0.5 if it has none)
+    verifier_threshold: float | None = None
 
 
 class WakeWordConfig(BaseModel):
@@ -297,6 +330,8 @@ class WakeWordConfig(BaseModel):
     # and the loss uses the highest score. 0 trains on single windows. Needs
     # augmentation.clip_duration >= 2.0 + 0.08 * max_pool_steps.
     max_pool_steps: int = Field(default=0, ge=0)
+    # Second-stage verifier trained by ``train-verifier`` (positives vs near misses)
+    verifier: VerifierConfig = Field(default_factory=VerifierConfig)
 
     @model_validator(mode="after")
     def _check_negative_shares(self) -> Self:
@@ -328,6 +363,11 @@ class WakeWordConfig(BaseModel):
     @property
     def model_output_dir(self) -> Path:
         return Path(self.output_dir) / self.model_name
+
+    @property
+    def verifier_name(self) -> str:
+        """File stem of the verifier model (``<model_name>_verifier``)."""
+        return f"{self.model_name}_verifier"
 
     @property
     def feature_steps(self) -> int:

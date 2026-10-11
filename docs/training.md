@@ -180,24 +180,38 @@ Longer examples need longer clips: set `augmentation.clip_duration` to at least
 loading rejects a shorter clip. The ACAV100M negatives are contiguous, so they are cut into
 blocks of 16 + K steps.
 
-## Training a Verifier
+## Second-Stage Verifier
 
-A verifier is a second classifier that the listener runs only when the main model fires
-(see [export-and-inference.md](export-and-inference.md#speech-gate-and-verifier)). It sees
-only candidate detections, so it can be larger and specialise in telling the wake word from
-its near-misses. It uses the same pipeline with a different config:
+**Source:** `src/livekit/wakeword/training/verifier.py`, CLI `livekit-wakeword train-verifier <config>`
 
-1. Copy the main config, and change `model_name` (e.g. `hey_zuck_verifier`) and
-   `model.model_size` (e.g. `large`).
-2. Point it at the main model's features instead of generating new data: copy or symlink
-   `positive_features_*.npy`, `negative_features_*.npy` and `background_noise_features_*.npy`
-   from the main model's output directory into the verifier's.
-3. Weight the batch toward the decision it makes:
-   ```yaml
-   batch_n_per_class: {positive: 100, adversarial_negative: 300, ACAV100M_sample: 256, background_noise: 25}
-   mixup_exclude_classes: [adversarial_negative]
-   ```
-4. Run `train` and `export`, then measure it with `streaming_eval.verifier_model`.
+Trains the optional `WakeWordVerifier` (see
+[export-and-inference.md](export-and-inference.md#speech-gate-and-verifier)).
+
+- The listener runs it only after the main model fires, so it can be larger and specialise in
+  telling the wake word from its near misses.
+- It reuses the features `augment` already extracted, so it needs no new data or second config.
+- **Classes** (`verifier.batch_n_per_class`): `positive` (128) against `adversarial_negative`
+  near misses (256), plus a little `ACAV100M_sample` speech (64). Missing optional files are
+  skipped.
+- **Model** (`verifier.model`): `conv_attention` `medium` by default.
+- **Training:** one phase of `verifier.steps` (20,000), focal loss, no mixup or negative
+  weighting. Features with `max_pool_steps` context keep their last 16 steps.
+- **Threshold:** the highest that keeps `verifier.target_recall` (0.98) of
+  `positive_features_test`. It is stored in the ONNX model.
+- **Checkpoints:** ranked by the share of `negative_features_test` near misses rejected at that
+  recall; the best `verifier.n_average` (3) are averaged.
+- **Outputs:** `<model_name>_verifier.pt`, `.onnx` and `_metrics.json` in the model directory.
+
+```yaml
+verifier:
+  model: {model_type: conv_attention, model_size: medium}
+  steps: 20000
+  batch_n_per_class: {positive: 128, adversarial_negative: 256, ACAV100M_sample: 64}
+  target_recall: 0.98
+```
+
+Measure it with `livekit-wakeword eval <config> --streaming --verifier <path to verifier.onnx>`
+(or `streaming_eval.verifier_model`).
 
 ## Validation
 

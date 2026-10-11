@@ -174,8 +174,8 @@ WakeWordListener(
     min_consecutive: int = 1, # 80 ms frames in a row a score must reach threshold to fire
     vad_aggressiveness: int | None = None,  # 0-3 enables the speech gate
     vad_window: float = 1.0,       # seconds the speech gate looks back over
-    verifier: WakeWordModel | None = None,  # second-stage model, run only on detections
-    verifier_threshold: float = 0.5,
+    verifier: WakeWordVerifier | WakeWordModel | None = None,  # second stage, run only on detections
+    verifier_threshold: float | None = None,  # None: the verifier's stored threshold (or 0.5)
 )
 ```
 
@@ -186,11 +186,13 @@ Two optional checks sit between the scores and a detection:
 - **Speech gate** (`vad_aggressiveness`): WebRTC VAD runs on every 20 ms of audio, and a
   detection also needs at least 60 ms of speech within the last `vad_window` seconds. Noise
   that happens to score high (music, clatter) cannot fire. It costs well under 1% of a core.
-- **Verifier** (`verifier`): a second `WakeWordModel` that scores the last 2 s of audio only
-  when the main model fires. Use its classifier with the same name as the detection, or give
-  it a single classifier. Below `verifier_threshold` the detection is dropped and listening
-  continues. Because it runs only on candidates, it can be a larger classifier trained on
-  positives against near-misses (see [training.md](training.md#training-a-verifier)).
+- **Verifier** (`verifier`): a second classifier run once, only when the main model fires.
+  - It scores the same `(16, 96)` embeddings that hop used, so it costs one classifier call.
+  - Below `verifier_threshold` the detection is dropped and listening continues (no debounce,
+    and the `min_consecutive` run starts over).
+  - `listener.rejected_triggers` counts rejections; `Detection.verifier_score` has the score.
+  - Pass a `WakeWordVerifier` (see [Second-Stage Verifier](#second-stage-verifier)), or a
+    `WakeWordModel`, whose classifier with the detection's name (or its only one) is used.
 
 ```python
 listener = WakeWordListener(
@@ -198,13 +200,13 @@ listener = WakeWordListener(
     threshold=0.5,
     min_consecutive=2,
     vad_aggressiveness=2,
-    verifier=WakeWordModel(models=["hey_zuck_verifier.onnx"]),
-    verifier_threshold=0.5,
+    verifier=WakeWordVerifier("hey_zuck_verifier.onnx"),
 )
 ```
 
 `livekit-wakeword eval --streaming` applies the same checks when `streaming_eval` sets
-`vad_aggressiveness` or `verifier_model`, so their effect can be measured before deploying.
+`vad_aggressiveness` or `verifier_model` (or with `--verifier PATH`), so their effect can be
+measured before deploying.
 
 #### Detection Result
 
@@ -214,7 +216,34 @@ class Detection:
     name: str        # Model name that triggered
     confidence: float  # Score (0-1)
     timestamp: float   # Monotonic time
+    verifier_score: float | None = None  # Second-stage score, None without a verifier
 ```
+
+### Second-Stage Verifier
+
+`WakeWordVerifier` loads any classifier ONNX taking `(batch, 16, 96)` embeddings.
+
+- It runs only after the main model fires, so it can be a larger model trained to separate the
+  wake phrase from its near misses.
+- Train one with `livekit-wakeword train-verifier <config>` (see
+  [Training](training.md#second-stage-verifier)).
+
+```python
+from livekit.wakeword import WakeWordListener, WakeWordModel, WakeWordVerifier
+
+model = WakeWordModel(models=["hey_livekit.onnx"])
+verifier = WakeWordVerifier("hey_livekit_verifier.onnx")  # threshold read from the model
+
+async with WakeWordListener(model, threshold=0.5, verifier=verifier) as listener:
+    detection = await listener.wait_for_detection()
+    print(detection.confidence, detection.verifier_score)
+```
+
+- `WakeWordVerifier(path, threshold=None)` uses the threshold `train-verifier` stored in the
+  model, or 0.5 if there is none.
+- Outside the listener, call `score(embeddings)` or `score_batch(...)`. `WakeWordModel.embed(audio)` gives the embeddings for ~2 s of audio.
+- Measure it with `livekit-wakeword eval <config> --streaming --verifier <path>`. This writes
+  `*_streaming_eval_verified.json` next to the baseline report.
 
 #### Lifecycle
 

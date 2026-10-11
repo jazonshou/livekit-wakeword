@@ -284,6 +284,7 @@ Or run stages individually:
 livekit-wakeword generate configs/prod.yaml  # TTS synthesis + adversarial negatives
 livekit-wakeword augment configs/prod.yaml   # Augment + extract features
 livekit-wakeword train configs/prod.yaml     # 3-phase adaptive training
+livekit-wakeword train-verifier configs/prod.yaml  # Optional second-stage verifier
 livekit-wakeword export configs/prod.yaml    # Export to ONNX (default)
 livekit-wakeword eval configs/prod.yaml      # Evaluate model (DET curve, AUT, FPPH)
 ```

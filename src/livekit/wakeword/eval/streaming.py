@@ -54,6 +54,8 @@ class FrameScorer(Protocol):
 
     def process_frame(self, frame: np.ndarray) -> dict[str, float]: ...
 
+    def embeddings(self) -> np.ndarray | None: ...
+
 
 class WindowScorer:
     """Scores each hop with ``WakeWordModel.predict()`` on the last 2 s of audio.
@@ -76,6 +78,12 @@ class WindowScorer:
         scores: dict[str, float] = self._model.predict(np.concatenate(list(self._frames)))
         return scores
 
+    def embeddings(self) -> np.ndarray | None:
+        if len(self._frames) < WINDOW_FRAMES:
+            return None
+        emb: np.ndarray | None = self._model.embed(np.concatenate(list(self._frames)))
+        return emb
+
 
 class StreamScorer:
     """Scores each hop with :class:`StreamingWakeWordModel`, the path the listener runs."""
@@ -91,6 +99,38 @@ class StreamScorer:
     def process_frame(self, frame: np.ndarray) -> dict[str, float]:
         hops = self._stream.process(frame)
         return hops[-1] if hops else {}
+
+    def embeddings(self) -> np.ndarray | None:
+        return self._stream.embeddings()
+
+
+class VerifiedScorer:
+    """Zeroes a hop's scores when a second-stage verifier rejects that hop's embeddings.
+
+    As in the listener, the verifier scores the embeddings the hop was scored on, and
+    a rejected hop counts as below threshold (it breaks a ``min_consecutive`` run).
+    Verifying every hop is one classifier call each, so DET points at every
+    threshold are exact.
+    """
+
+    def __init__(self, scorer: FrameScorer, verifier: Any) -> None:
+        self._scorer = scorer
+        self._verifier = verifier
+
+    def reset(self) -> None:
+        self._scorer.reset()
+
+    def process_frame(self, frame: np.ndarray) -> dict[str, float]:
+        scores = self._scorer.process_frame(frame)
+        if not scores:
+            return scores
+        emb = self._scorer.embeddings()
+        if emb is not None and self._verifier.score(emb) >= self._verifier.threshold:
+            return scores
+        return {name: 0.0 for name in scores}
+
+    def embeddings(self) -> np.ndarray | None:
+        return self._scorer.embeddings()
 
 
 def make_scorer(model_path: str | Path, kind: str = "streaming") -> tuple[FrameScorer, str]:
@@ -230,40 +270,24 @@ def score_audio(scorer: FrameScorer, audio: np.ndarray, model_name: str) -> np.n
 def apply_checks(
     audio: np.ndarray,
     scores: np.ndarray,
-    model_name: str,
     *,
     gate: Any = None,
-    verifier: Any = None,
-    verifier_threshold: float = 0.5,
-    verifier_min_score: float = 0.1,
 ) -> np.ndarray:
-    """Zero the hop scores the listener's VAD gate or verifier would block.
+    """Zero the hop scores the listener's VAD gate would block.
 
     Mirrors :class:`~livekit.wakeword.inference.listener.WakeWordListener`: the gate
-    is updated with each 80 ms frame before that hop's score is used, and the
-    verifier scores the 2 s of audio ending at the hop. To keep it affordable the
-    verifier only runs at hops scoring ``verifier_min_score`` or more, so DET points
-    below that threshold are not verified.
+    is updated with each 80 ms frame before that hop's score is used.  (The verifier
+    is applied while scoring, by :class:`VerifiedScorer`.)
     """
-    from ..inference.gating import verifier_score
-
     out = scores.astype(np.float32, copy=True)
+    if gate is None:
+        return out
     padded = np.zeros(out.shape[0] * FRAME_SAMPLES, dtype=np.float32)
     padded[: min(audio.shape[0], padded.shape[0])] = audio[: padded.shape[0]]
-    if gate is not None:
-        gate.reset()
-        for i in range(out.shape[0]):
-            if not gate.update(padded[i * FRAME_SAMPLES : (i + 1) * FRAME_SAMPLES]):
-                out[i] = 0.0
-    if verifier is not None:
-        window = WINDOW_FRAMES * FRAME_SAMPLES
-        for hop in np.flatnonzero(out >= verifier_min_score).tolist():
-            end = (hop + 1) * FRAME_SAMPLES
-            if end < window:
-                continue
-            v = verifier_score(verifier.predict(padded[end - window : end]), model_name)
-            if v < verifier_threshold:
-                out[hop] = 0.0
+    gate.reset()
+    for i in range(out.shape[0]):
+        if not gate.update(padded[i * FRAME_SAMPLES : (i + 1) * FRAME_SAMPLES]):
+            out[i] = 0.0
     return out
 
 
@@ -386,14 +410,23 @@ def _stream_from_validation_features(config: WakeWordConfig) -> np.ndarray | Non
     return val if val.ndim == 2 else None
 
 
-def _score_validation_stream(model_path: Path, stream: np.ndarray) -> np.ndarray:
+def _score_validation_stream(
+    model_path: Path, stream: np.ndarray, verifier: Any = None
+) -> np.ndarray:
     import onnxruntime as ort
 
     from ..training.validation import score_stream
     from .evaluate import _predict_onnx
 
     session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
-    return score_stream(lambda x: _predict_onnx(session, x, batch_size=x.shape[0]), stream)
+
+    def predict(x: np.ndarray) -> np.ndarray:
+        scores = _predict_onnx(session, x, batch_size=x.shape[0])
+        if verifier is not None:
+            scores = np.where(verifier.score_batch(x) >= verifier.threshold, scores, 0.0)
+        return np.asarray(scores, dtype=np.float32)
+
+    return score_stream(predict, stream)
 
 
 def _plot(
@@ -443,6 +476,8 @@ def run_streaming_eval(
     *,
     scorer: str = "streaming",
     threshold: float | None = None,
+    verifier_path: str | Path | None = None,
+    verifier_threshold: float | None = None,
 ) -> dict[str, Any]:
     """Run the streaming evaluation and write ``<model>_streaming_eval.json``.
 
@@ -453,6 +488,12 @@ def run_streaming_eval(
         scorer: ``"streaming"`` or ``"window"`` (see :func:`make_scorer`).
         threshold: Report per-set results at this threshold instead of the
             selected one.
+        verifier_path: Second-stage verifier ONNX model (default
+            ``streaming_eval.verifier_model``).  A hop counts only if the verifier
+            accepts it, as in ``WakeWordListener(verifier=...)``.  Outputs are
+            written with a ``_verified`` suffix so they sit next to the baseline's.
+        verifier_threshold: Verifier threshold (default
+            ``streaming_eval.verifier_threshold``, then the one stored in the model).
 
     Returns:
         The report written to JSON.
@@ -493,12 +534,17 @@ def run_streaming_eval(
         from ..inference.gating import SpeechGate
 
         gate = SpeechGate(cfg.vad_aggressiveness, cfg.vad_window_seconds)
-    verifier = None
-    if cfg.verifier_model:
-        from ..inference.model import WakeWordModel
-
-        verifier = WakeWordModel(models=[cfg.verifier_model])
     logger.info("Streaming eval of %s with the %s scorer", model_name, scorer_used)
+    verifier = None
+    verifier_path = verifier_path or cfg.verifier_model
+    if verifier_path:
+        from ..inference.verifier import WakeWordVerifier
+
+        if verifier_threshold is None:
+            verifier_threshold = cfg.verifier_threshold
+        verifier = WakeWordVerifier(verifier_path, threshold=verifier_threshold)
+        frame_scorer = VerifiedScorer(frame_scorer, verifier)
+        logger.info("Gating with verifier %s (threshold %.3f)", verifier.name, verifier.threshold)
 
     scored: list[tuple[EvalStream, np.ndarray]] = []
     for spec in sets:
@@ -529,21 +575,13 @@ def run_streaming_eval(
             stream.audio.shape[0] / SAMPLE_RATE / 60,
         )
         scores = score_audio(frame_scorer, stream.audio, model_name)
-        if gate is not None or verifier is not None:
-            scores = apply_checks(
-                stream.audio,
-                scores,
-                model_name,
-                gate=gate,
-                verifier=verifier,
-                verifier_threshold=cfg.verifier_threshold,
-                verifier_min_score=cfg.verifier_min_score,
-            )
+        if gate is not None:
+            scores = apply_checks(stream.audio, scores, gate=gate)
         scored.append((stream, scores))
 
     val = _stream_from_validation_features(config)
     if val is not None:
-        val_scores = _score_validation_stream(model_path, val)
+        val_scores = _score_validation_stream(model_path, val, verifier)
         val_stream = EvalStream(
             name="validation_stream",
             positive=False,
@@ -567,11 +605,11 @@ def run_streaming_eval(
     report: dict[str, Any] = {
         "model": model_name,
         "scorer": scorer_used,
+        "verifier": None if verifier is None else verifier.name,
+        "verifier_threshold": None if verifier is None else verifier.threshold,
         "debounce_seconds": cfg.debounce_seconds,
         "min_consecutive": cfg.min_consecutive,
         "vad_aggressiveness": cfg.vad_aggressiveness,
-        "verifier_model": cfg.verifier_model,
-        "verifier_threshold": cfg.verifier_threshold if cfg.verifier_model else None,
         "target_fa_per_hour": cfg.target_fa_per_hour,
         "selected_threshold": chosen["threshold"],
         "target_met": target_met,
@@ -597,10 +635,13 @@ def run_streaming_eval(
 
     out_dir = config.model_output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
-    json_path = out_dir / f"{config.model_name}_streaming_eval.json"
+    stem = f"{config.model_name}_streaming"
+    suffix = "" if verifier is None else "_verified"
+    json_path = out_dir / f"{stem}_eval{suffix}.json"
     json_path.write_text(json.dumps(report, indent=2) + "\n")
     per_hop: dict[str, Any] = {stream.name: scores for stream, scores in scored}
-    np.savez_compressed(out_dir / f"{config.model_name}_streaming_scores.npz", **per_hop)
-    _plot(points, chosen, out_dir / f"{config.model_name}_streaming_det.png", model_name)
+    np.savez_compressed(out_dir / f"{stem}_scores{suffix}.npz", **per_hop)
+    title = model_name if verifier is None else f"{model_name} + {verifier.name}"
+    _plot(points, chosen, out_dir / f"{stem}_det{suffix}.png", title)
     logger.info("Streaming eval saved to %s", json_path)
     return report
