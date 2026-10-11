@@ -32,6 +32,9 @@ dependencies = [
 listener = [
     "pyaudio>=0.2.14",
 ]
+vad = [
+    "webrtcvad-wheels>=2.0.14",
+]
 train = [
     "torch>=2.5",
     "torchaudio>=2.5",

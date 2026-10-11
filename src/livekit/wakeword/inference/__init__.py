@@ -3,5 +3,12 @@
 from .listener import Detection, WakeWordListener
 from .model import WakeWordModel
 from .streaming import StreamingWakeWordModel
+from .vad import VoiceActivityGate
 
-__all__ = ["Detection", "StreamingWakeWordModel", "WakeWordListener", "WakeWordModel"]
+__all__ = [
+    "Detection",
+    "StreamingWakeWordModel",
+    "VoiceActivityGate",
+    "WakeWordListener",
+    "WakeWordModel",
+]

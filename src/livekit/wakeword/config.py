@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Self
+from typing import Annotated, Literal, Self
 
 import yaml
 from pydantic import BaseModel, Field, model_validator
@@ -162,6 +162,9 @@ class StreamingEvalConfig(BaseModel):
     # Detector behaviour, shared with training validation
     debounce_seconds: float = 2.0
     min_consecutive: int = 1
+    # Score audio sets through the listener's VoiceActivityGate ("energy" or "webrtc").
+    # The feature-only validation_stream has no audio and stays ungated.
+    vad: Literal["energy", "webrtc"] | None = None
     # Threshold selection: lowest miss rate with at most this many false accepts per hour
     target_fa_per_hour: float = 0.5
     # A detection counts as a hit up to this long after the clip ends

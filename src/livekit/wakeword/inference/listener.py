@@ -12,6 +12,7 @@ import numpy as np
 
 from .model import WakeWordModel
 from .streaming import StreamingWakeWordModel
+from .vad import VoiceActivityGate
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +58,7 @@ class WakeWordListener:
         threshold: float = 0.5,
         debounce: float = 2.0,
         min_consecutive: int = 1,
+        vad: VoiceActivityGate | None = None,
     ):
         """Initialize listener.
 
@@ -68,6 +70,10 @@ class WakeWordListener:
             min_consecutive: Number of consecutive 80 ms frames a model's
                 score must stay at or above ``threshold`` before it fires.
                 The default of 1 fires on the first frame above threshold.
+            vad: Optional voice activity gate.  When given, a frame only
+                counts toward a detection while the gate reports speech in
+                its recent window, so noise, music or silence that happens to
+                score high cannot fire.  ``None`` (default) disables gating.
         """
         if min_consecutive < 1:
             raise ValueError(f"min_consecutive must be >= 1, got {min_consecutive}")
@@ -77,6 +83,7 @@ class WakeWordListener:
         self._threshold = threshold
         self._debounce = debounce
         self._min_consecutive = min_consecutive
+        self._vad = vad
         # Consecutive frames each model has scored at or above threshold
         self._consecutive: dict[str, int] = {}
 
@@ -117,8 +124,7 @@ class WakeWordListener:
         self._listening.set()
         self._done_event.clear()
         self._error = None
-        self._model.reset()
-        self._consecutive.clear()
+        self._reset_state()
         self._detection_queue = asyncio.Queue()
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self._task = asyncio.create_task(self._audio_loop())
@@ -178,9 +184,9 @@ class WakeWordListener:
                 frame = np.frombuffer(data, dtype=np.int16)
 
                 # Score the new frame in the executor (empty while warming up)
-                hop_scores = await loop.run_in_executor(
+                hop_scores, speech = await loop.run_in_executor(
                     self._executor,
-                    self._model.process,
+                    self._process_frame,
                     frame,
                 )
                 if not self._running:
@@ -188,14 +194,13 @@ class WakeWordListener:
 
                 # Check for detections (lightweight, fine on event loop)
                 for scores in hop_scores:
-                    detection = self._check_scores(scores)
+                    detection = self._check_scores(scores, speech=speech)
                     if detection is not None:
                         # Pause the loop and drop buffered audio so no stale
                         # audio is processed while the consumer handles the
                         # detection.
                         self._listening.clear()
-                        self._model.reset()
-                        self._consecutive.clear()
+                        self._reset_state()
                         await self._detection_queue.put(detection)
                         break  # one detection per iteration
         except asyncio.CancelledError:
@@ -206,12 +211,29 @@ class WakeWordListener:
         finally:
             self._done_event.set()
 
-    def _check_scores(self, scores: dict[str, float]) -> Detection | None:
-        """Update consecutive counts with one frame's scores; return a detection if one fires."""
+    def _reset_state(self) -> None:
+        """Drop buffered audio and per-model counts."""
+        self._model.reset()
+        if self._vad is not None:
+            self._vad.reset()
+        self._consecutive.clear()
+
+    def _process_frame(self, frame: np.ndarray) -> tuple[list[dict[str, float]], bool]:
+        """Score one frame and update the VAD gate; returns (hop scores, speech present)."""
+        speech = self._vad.process(frame) if self._vad is not None else True
+        return self._model.process(frame), speech
+
+    def _check_scores(self, scores: dict[str, float], *, speech: bool = True) -> Detection | None:
+        """Update consecutive counts with one frame's scores; return a detection if one fires.
+
+        While ``speech`` is False (the VAD gate is closed) no frame counts as
+        above threshold, so nothing fires and runs of consecutive frames restart.
+        """
         now = time.monotonic()
         detection = None
         for name, score in scores.items():
-            count = self._consecutive.get(name, 0) + 1 if score >= self._threshold else 0
+            above = speech and score >= self._threshold
+            count = self._consecutive.get(name, 0) + 1 if above else 0
             self._consecutive[name] = count
             if (
                 detection is None
@@ -257,8 +279,6 @@ class WakeWordListener:
             return self._detection_queue.get_nowait()
 
         if self._error is not None:
-            raise RuntimeError(
-                f"Audio loop crashed: {self._error}"
-            ) from self._error
+            raise RuntimeError(f"Audio loop crashed: {self._error}") from self._error
 
         raise RuntimeError("Audio loop ended unexpectedly")

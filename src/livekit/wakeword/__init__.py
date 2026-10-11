@@ -3,6 +3,7 @@
 from .inference.listener import Detection, WakeWordListener
 from .inference.model import WakeWordModel
 from .inference.streaming import StreamingWakeWordModel
+from .inference.vad import VoiceActivityGate
 
 __version__ = "0.1.0"
 
@@ -35,6 +36,7 @@ __all__ = [
     "WakeWordConfig",
     "ExportFormat",
     "StreamingWakeWordModel",
+    "VoiceActivityGate",
     "WakeWordListener",
     "WakeWordModel",
     "Detection",

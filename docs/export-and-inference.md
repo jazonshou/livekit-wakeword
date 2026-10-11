@@ -165,9 +165,37 @@ WakeWordListener(
     model: WakeWordModel | StreamingWakeWordModel,  # loaded classifiers
     threshold: float = 0.5,  # Detection threshold (0-1)
     debounce: float = 2.0,   # Minimum seconds between detections
-    min_consecutive: int = 1 # 80 ms frames in a row a score must reach threshold to fire
+    min_consecutive: int = 1, # 80 ms frames in a row a score must reach threshold to fire
+    vad: VoiceActivityGate | None = None,  # optional speech gate (off by default)
 )
 ```
+
+#### Voice activity gate
+
+Pass a `VoiceActivityGate` to stop the wake word firing when nobody is speaking (fans, music
+without vocals, clicks). Each 10 ms of audio is classified as speech or not; a frame only
+counts toward a detection while at least `min_speech_seconds` (0.15 s) of speech fell within
+the last `window_seconds` (2 s, the classifier's window). While the gate is closed, runs of
+`min_consecutive` frames restart.
+
+```python
+from livekit.wakeword import VoiceActivityGate, WakeWordListener
+
+listener = WakeWordListener(model, threshold=0.5, vad=VoiceActivityGate())          # energy
+listener = WakeWordListener(model, threshold=0.5, vad=VoiceActivityGate("webrtc"))  # WebRTC VAD
+```
+
+| Backend | Needs | Speech test | Cost per 80 ms hop (x86) |
+|---------|-------|-------------|--------------------------|
+| `"energy"` (default) | numpy only | level ≥ adaptive noise floor + `threshold_db` (10 dB) and ≥ `min_dbfs` (-55 dBFS) | ~20 µs |
+| `"webrtc"` | `pip install livekit-wakeword[vad]` | WebRTC VAD at `aggressiveness` (0-3, default 2) | ~30 µs |
+
+The energy backend's noise floor drops instantly and rises at most `noise_rise_db_per_second`
+(3 dB/s), so a sudden loud steady noise counts as speech for a few seconds; the WebRTC
+backend rejects such noise better. Either is negligible next to the embedding model on a Pi.
+The gate also works standalone with `StreamingWakeWordModel`: call `gate.process(frame)`
+alongside `stream.process(frame)` and ignore scores while it returns `False`.
+Set `streaming_eval.vad: energy` (or `webrtc`) to measure the gate with `eval --streaming`.
 
 #### Detection Result
 

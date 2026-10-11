@@ -34,6 +34,7 @@ from typing import Any, Protocol
 import numpy as np
 
 from ..config import StreamingEvalSet, WakeWordConfig
+from ..inference.vad import VoiceActivityGate
 from ..training.metrics import HOP_SECONDS, detection_indices
 
 logger = logging.getLogger(__name__)
@@ -214,16 +215,29 @@ def build_stream(
     )
 
 
-def score_audio(scorer: FrameScorer, audio: np.ndarray, model_name: str) -> np.ndarray:
-    """Feed audio through the scorer in 80 ms frames; one score per hop."""
+def score_audio(
+    scorer: FrameScorer,
+    audio: np.ndarray,
+    model_name: str,
+    gate: VoiceActivityGate | None = None,
+) -> np.ndarray:
+    """Feed audio through the scorer in 80 ms frames; one score per hop.
+
+    With a ``gate``, hops where it reports no speech score 0, as the listener's
+    VAD gate would keep them from firing.
+    """
     scorer.reset()
+    if gate is not None:
+        gate.reset()
     n_hops = int(np.ceil(audio.shape[0] / FRAME_SAMPLES))
     padded = np.zeros(n_hops * FRAME_SAMPLES, dtype=np.float32)
     padded[: audio.shape[0]] = audio
     scores = np.zeros(n_hops, dtype=np.float32)
     for i in range(n_hops):
-        out = scorer.process_frame(padded[i * FRAME_SAMPLES : (i + 1) * FRAME_SAMPLES])
-        scores[i] = out.get(model_name, 0.0)
+        frame = padded[i * FRAME_SAMPLES : (i + 1) * FRAME_SAMPLES]
+        speech = gate.process(frame) if gate is not None else True
+        out = scorer.process_frame(frame)
+        scores[i] = out.get(model_name, 0.0) if speech else 0.0
     return scores
 
 
@@ -441,6 +455,9 @@ def run_streaming_eval(
 
     frame_scorer, scorer_used = make_scorer(model_path, scorer)
     logger.info("Streaming eval of %s with the %s scorer", model_name, scorer_used)
+    gate = VoiceActivityGate(cfg.vad) if cfg.vad else None
+    if gate is not None:
+        logger.info("VAD gate (%s) on audio sets; validation_stream is ungated", cfg.vad)
 
     scored: list[tuple[EvalStream, np.ndarray]] = []
     for spec in sets:
@@ -470,7 +487,7 @@ def run_streaming_eval(
             len(files),
             stream.audio.shape[0] / SAMPLE_RATE / 60,
         )
-        scored.append((stream, score_audio(frame_scorer, stream.audio, model_name)))
+        scored.append((stream, score_audio(frame_scorer, stream.audio, model_name, gate)))
 
     val = _stream_from_validation_features(config)
     if val is not None:
@@ -500,6 +517,7 @@ def run_streaming_eval(
         "scorer": scorer_used,
         "debounce_seconds": cfg.debounce_seconds,
         "min_consecutive": cfg.min_consecutive,
+        "vad": cfg.vad,
         "target_fa_per_hour": cfg.target_fa_per_hour,
         "selected_threshold": chosen["threshold"],
         "target_met": target_met,

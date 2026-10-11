@@ -196,6 +196,7 @@ variant, "hey + other word" phrases, long household recordings) under `streaming
 streaming_eval:
   debounce_seconds: 2.0
   min_consecutive: 1
+  vad: null              # energy | webrtc: zero scores on hops the listener's VAD gate blocks
   target_fa_per_hour: 0.5
   max_clips_per_set: 1000
   sets:
