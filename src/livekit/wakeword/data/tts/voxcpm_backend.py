@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 
 from ...config import WakeWordConfig
+from .voices import split_voices
 
 logger = logging.getLogger(__name__)
 
@@ -53,12 +54,16 @@ class VoxCpmBackend:
         voice_design_prompts: list[str],
         cfg_values: list[float],
         inference_timesteps_list: list[int],
+        test_voice_fraction: float = 0.0,
+        seed: int = 0,
     ) -> None:
         self._model_dir = model_dir
         self._load_denoiser = load_denoiser
         self._prompts = voice_design_prompts
         self._cfg_values = cfg_values
         self._timesteps = inference_timesteps_list
+        self._test_voice_fraction = test_voice_fraction
+        self._seed = seed
         self._model: Any = None
 
     @classmethod
@@ -70,6 +75,8 @@ class VoxCpmBackend:
             voice_design_prompts=list(vt.voice_design_prompts),
             cfg_values=list(vt.cfg_values),
             inference_timesteps_list=list(vt.inference_timesteps_list),
+            test_voice_fraction=config.test_voice_fraction,
+            seed=config.seed,
         )
 
     def _ensure_model(self) -> Any:
@@ -117,10 +124,18 @@ class VoxCpmBackend:
         *,
         start_index: int = 0,
         batch_size: int = 50,
+        holdout_voices: bool = False,
+        voice_group_size: int = 1,
     ) -> list[Path]:
         del batch_size  # sequential generation only
         if not phrases:
             raise ValueError("phrases must be non-empty")
+        # Voice-design personas are the voices: test splits get their own
+        train_idx, test_idx = split_voices(
+            len(self._prompts), self._test_voice_fraction, self._seed
+        )
+        prompts = [self._prompts[i] for i in (test_idx if holdout_voices else train_idx)]
+        group = max(1, voice_group_size)
         output_dir.mkdir(parents=True, exist_ok=True)
 
         model = self._ensure_model()
@@ -141,10 +156,10 @@ class VoxCpmBackend:
         for sample_idx in pbar:
             phrase = phrases[sample_idx % len(phrases)]
             prompt, cfg_v, steps = diversification_triple_at_index(
-                self._prompts,
+                prompts,
                 self._cfg_values,
                 self._timesteps,
-                sample_idx,
+                sample_idx // group,
             )
             text = f"({prompt}){phrase}"
             try:

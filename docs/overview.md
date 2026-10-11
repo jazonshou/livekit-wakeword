@@ -75,6 +75,7 @@ src/livekit/wakeword/
 │   └── onnx.py                  ONNX export + INT8 quantization
 └── inference/
     ├── model.py                 WakeWordModel class (simple prediction API)
+    ├── streaming.py             StreamingWakeWordModel (incremental 80 ms hop scoring)
     └── listener.py              WakeWordListener class (async microphone detection)
 ```
 

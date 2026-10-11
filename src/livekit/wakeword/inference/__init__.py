@@ -2,5 +2,6 @@
 
 from .listener import Detection, WakeWordListener
 from .model import WakeWordModel
+from .streaming import StreamingWakeWordModel
 
-__all__ = ["Detection", "WakeWordListener", "WakeWordModel"]
+__all__ = ["Detection", "StreamingWakeWordModel", "WakeWordListener", "WakeWordModel"]

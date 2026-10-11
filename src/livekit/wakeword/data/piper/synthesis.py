@@ -11,6 +11,10 @@ Adaptations from dscripka's original:
 - Load via state_dict + config JSON (no pickle, no piper_train dependency)
 - Add type annotations for mypy strict mode
 - Remove argparse CLI, auto_reduce_batch_size, file_names params
+- Keep clause punctuation (pauses) through phonemization
+- Sample speaker pairs at random from a speaker pool (instead of walking pairs in
+  order), so a split covers all voices and test splits can use held-out speakers
+- Trim only leading/trailing silence, keeping pauses inside the phrase
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ from __future__ import annotations
 import itertools as it
 import json
 import logging
+import re
 import shutil
 import subprocess
 import unicodedata
@@ -79,16 +84,56 @@ def _find_espeak_ng() -> str:
     return path
 
 
+# Clause punctuation that VITS (Piper) models have phoneme ids for. ``espeak-ng --ipa``
+# turns a comma into a line break and drops a full stop, so without this the pause
+# in e.g. "hey, computer" never reaches the model.
+_CLAUSE_PUNCT_RE = re.compile(r"\s*([,.;:!?])\s*")
+
+
 def _espeak_phonemize(text: str, voice: str = "en-us") -> str:
-    """Phonemize text using the espeak-ng CLI."""
+    """Phonemize text using the espeak-ng CLI, keeping clause punctuation.
+
+    Each clause is phonemized separately and rejoined with its punctuation, the
+    same output piper-phonemize produces (``"hˈeɪ, zˈʌk"``).
+    """
     espeak = _find_espeak_ng()
-    result = subprocess.run(
-        [espeak, "--ipa", "-q", "-v", voice, text],
-        capture_output=True,
-        encoding="utf-8",
-        check=True,
-    )
-    return result.stdout.strip()
+    parts = _CLAUSE_PUNCT_RE.split(text.strip())
+    out: list[str] = []
+    # parts alternates clause, punctuation, clause, punctuation, ...
+    for i in range(0, len(parts), 2):
+        clause = parts[i].strip()
+        punct = parts[i + 1] if i + 1 < len(parts) else ""
+        if clause:
+            result = subprocess.run(
+                [espeak, "--ipa", "-q", "-v", voice, clause],
+                capture_output=True,
+                encoding="utf-8",
+                check=True,
+            )
+            out.append(" ".join(result.stdout.split()))
+        if punct:
+            if out:
+                out[-1] += punct
+            else:
+                out.append(punct)
+    return " ".join(out)
+
+
+def speaker_pair_at_index(
+    speaker_ids: list[int],
+    index: int,
+    seed: int = 0,
+) -> tuple[int, int]:
+    """Return the SLERP speaker pair for voice *index* (deterministic, resume-safe).
+
+    Both speakers are drawn uniformly from *speaker_ids*, so even a short split
+    spreads over the whole pool instead of the first few speakers.
+    """
+    if not speaker_ids:
+        raise ValueError("speaker_ids must be non-empty")
+    rng = np.random.default_rng([seed, index])
+    a, b = rng.integers(0, len(speaker_ids), size=2)
+    return speaker_ids[int(a)], speaker_ids[int(b)]
 
 
 def _consume(iterator: Any, n: int) -> None:
@@ -109,8 +154,20 @@ def generate_samples(
     noise_scale_ws: list[float] | None = None,
     max_speakers: int | None = None,
     start_index: int = 0,
+    speaker_ids: list[int] | None = None,
+    seed: int = 0,
+    voice_group_size: int = 1,
 ) -> list[Path]:
-    """Generate synthetic speech clips with SLERP speaker blending."""
+    """Generate synthetic speech clips with SLERP speaker blending.
+
+    Args:
+        speaker_ids: Speaker pool to draw SLERP pairs from (``None`` = all speakers,
+            capped by *max_speakers*).
+        seed: Seed for the speaker-pair draw.
+        voice_group_size: Number of consecutive clips that share one voice (e.g. 2 to
+            synthesize the two halves of a phrase in the same voice). The batch size
+            is rounded up to a multiple of it so a group shares its TTS settings too.
+    """
     if slerp_weights is None:
         slerp_weights = [0.5]
     if length_scales is None:
@@ -143,6 +200,14 @@ def generate_samples(
     num_speakers: int = config["num_speakers"]
     if max_speakers is not None:
         num_speakers = min(num_speakers, max_speakers)
+    if speaker_ids is None:
+        speaker_ids = list(range(num_speakers))
+    else:
+        speaker_ids = [s for s in speaker_ids if 0 <= s < num_speakers]
+        if not speaker_ids:
+            raise ValueError(f"No speaker_ids within the model's {num_speakers} speakers")
+    voice_group_size = max(1, voice_group_size)
+    batch_size = -(-batch_size // voice_group_size) * voice_group_size
 
     resampler = torchaudio.transforms.Resample(
         22050,
@@ -154,13 +219,16 @@ def generate_samples(
     )
 
     settings_iter = it.cycle(it.product(slerp_weights, length_scales, noise_scales, noise_scale_ws))
-    speakers_iter = it.cycle(it.product(range(num_speakers), range(num_speakers)))
+    # Voices are a pure function of the clip index, so resuming needs no replay
+    speakers_iter = (
+        speaker_pair_at_index(speaker_ids, i // voice_group_size, seed)
+        for i in it.count(start_index)
+    )
     texts_iter = it.cycle(text)
 
     if start_index > 0:
         logger.info("Resuming generation from clip %d / %d", start_index, max_samples)
         _consume(settings_iter, (start_index + batch_size - 1) // batch_size)
-        _consume(speakers_iter, start_index)
         _consume(texts_iter, start_index)
 
     from tqdm import tqdm
@@ -173,7 +241,8 @@ def generate_samples(
     pbar = tqdm(total=max_samples, initial=start_index, desc="Synthesizing clips", unit="clip")
 
     while sample_idx < max_samples:
-        speakers_batch = list(it.islice(speakers_iter, batch_size))
+        n_batch = min(batch_size, max_samples - sample_idx)
+        speakers_batch = list(it.islice(speakers_iter, n_batch))
         if not speakers_batch:
             break
 
@@ -334,30 +403,31 @@ def remove_silence(
     x: np.ndarray,
     frame_duration: float = 0.030,
     sample_rate: int = 16000,
-    min_start: int = 2000,
+    padding: float = 0.06,
 ) -> np.ndarray:
-    """Trim silence from audio using WebRTC VAD."""
+    """Trim leading and trailing silence using WebRTC VAD.
+
+    Only the edges are trimmed: everything from *padding* seconds before the first
+    speech frame to *padding* seconds after the last one is kept, including pauses
+    inside the phrase (``"hey ... computer"``) that a live speaker may make.
+    """
     import webrtcvad
 
     vad = webrtcvad.Vad(0)
     if x.dtype in (np.float32, np.float64):
         x = (x * 32767).astype(np.int16)
 
-    x_new = x[:min_start].tolist()
     step_size = int(sample_rate * frame_duration)
-    for i in range(min_start, x.shape[0] - step_size, step_size):
-        if vad.is_speech(x[i : i + step_size].tobytes(), sample_rate):
-            x_new.extend(x[i : i + step_size].tolist())
-
-    result = np.array(x_new, dtype=np.int16)
-
-    min_speech_samples = int(sample_rate * 0.15)
-    if len(result) <= min_start + min_speech_samples:
-        logger.debug(
-            "VAD stripped too aggressively (%d samples left), keeping original", len(result)
-        )
-        if x.dtype != np.int16:
-            x = (x * 32767).astype(np.int16)
+    speech_frames = [
+        i
+        for i in range(0, x.shape[0] - step_size + 1, step_size)
+        if vad.is_speech(x[i : i + step_size].tobytes(), sample_rate)
+    ]
+    if not speech_frames:
+        logger.debug("VAD found no speech (%d samples), keeping original", len(x))
         return x
 
-    return result
+    pad = int(sample_rate * padding)
+    start = max(0, speech_frames[0] - pad)
+    end = min(x.shape[0], speech_frames[-1] + step_size + pad)
+    return x[start:end]

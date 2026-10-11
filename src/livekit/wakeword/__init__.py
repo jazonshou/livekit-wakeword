@@ -2,6 +2,7 @@
 
 from .inference.listener import Detection, WakeWordListener
 from .inference.model import WakeWordModel
+from .inference.streaming import StreamingWakeWordModel
 
 __version__ = "0.1.0"
 
@@ -33,6 +34,7 @@ def __getattr__(name: str) -> object:
 __all__ = [
     "WakeWordConfig",
     "ExportFormat",
+    "StreamingWakeWordModel",
     "WakeWordListener",
     "WakeWordModel",
     "Detection",

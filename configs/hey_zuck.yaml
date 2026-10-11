@@ -1,0 +1,97 @@
+# "hey zuck" wake word: production settings with the streaming-robustness options on.
+# See configs/prod.yaml for what every field does.
+model_name: hey_zuck
+
+# The comma variant is synthesized with a short pause between the words
+target_phrases: ["hey zuck", "hey, zuck"]
+
+n_samples: 25000
+n_samples_val: 5000
+n_background_samples: 2000
+n_background_samples_val: 500
+tts_batch_size: 50
+
+# Phrases that must not fire. They get custom_negative_share of the negative clips; the
+# rest are generated near-misses (one phoneme from "zuck") and "hey + word" swaps.
+custom_negative_phrases:
+  - "hey zach"
+  - "hey zack"
+  - "hey duck"
+  - "hey chuck"
+  - "hey buck"
+  - "hey luck"
+  - "hey suck"
+  - "hey tuck"
+  - "hey zook"
+  - "hey zeke"
+  - "hey jack"
+  - "hey there"
+  - "hey siri"
+  - "hey google"
+  - "hey alexa"
+  - "hey you"
+  - "hey guys"
+  - "zuck"
+  - "hey"
+  - "okay zuck"
+  - "say zuck"
+custom_negative_share: 0.3
+word_swap_share: 0.2
+negative_test_holdout: 0.2
+test_voice_fraction: 0.1
+
+# Speech placed before the phrase, and phrases split with a pause
+n_context_samples: 5000
+n_split_phrase_samples: 3000
+n_split_phrase_samples_val: 500
+
+noise_scales: [0.98]
+noise_scale_ws: [0.98]
+length_scales: [0.75, 1.0, 1.25]
+slerp_weights: [0.2, 0.35, 0.5, 0.65, 0.8]
+
+data_dir: ./data
+output_dir: ./output
+
+augmentation:
+  clip_duration: 2.0
+  batch_size: 16
+  rounds: 3
+  background_paths: [./data/backgrounds]
+  rir_paths: [./data/rirs]
+  end_jitter: 0.3
+  context_speech_probability: 0.5
+  near_miss_context_probability: 0.1
+  context_gap: [0.0, 0.4]
+  split_phrase_probability: 0.15
+  split_phrase_gap: [0.1, 0.5]
+
+model:
+  model_type: conv_attention
+  model_size: medium
+
+steps: 100000
+learning_rate: 0.0001
+weight_decay: 0.01
+label_smoothing: 0.05
+max_negative_weight: 3000
+# Validation now counts false accepts on every 80 ms hop of the stream
+target_fp_per_hour: 0.5
+
+batch_n_per_class:
+  positive: 50
+  adversarial_negative: 200
+  ACAV100M_sample: 1024
+  background_noise: 50
+
+mixup_alpha: 0.2
+mixup_exclude_classes: [adversarial_negative]
+
+# Second run only: sliding-window max-pooling loss (needs clip_duration 2.32)
+max_pool_steps: 0
+
+streaming_eval:
+  debounce_seconds: 2.0
+  min_consecutive: 2
+  target_fa_per_hour: 0.5
+  max_clips_per_set: 1000

@@ -14,7 +14,7 @@ from livekit.wakeword.data.augment import AudioAugmentor, align_clip_to_end, run
 
 SR = 16000
 TARGET = 32000  # 2s window
-JITTER = 3200  # 200ms
+JITTER = 4800  # 300ms (augmentation.end_jitter)
 
 
 def _write_noise(path: Path, seconds: float = 3.0) -> None:
@@ -113,3 +113,84 @@ class TestRunAugment:
                 out, _ = sf.read(str(path))
                 assert len(out) == TARGET
                 assert _longest_zero_run(out) < 16, path.name  # < 1ms
+
+
+def _write_clip(path: Path, seconds: float, value: float) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sf.write(str(path), np.full(int(seconds * SR), value, dtype=np.float32), SR)
+
+
+def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    """[start, end) runs where *mask* is True."""
+    edges = np.flatnonzero(np.diff(np.concatenate(([0], mask.astype(np.int8), [0]))))
+    return list(zip(edges[::2].tolist(), edges[1::2].tolist()))
+
+
+class TestPlacement:
+    @pytest.fixture
+    def config(self, sample_config: WakeWordConfig, monkeypatch) -> WakeWordConfig:
+        monkeypatch.setattr(AudioAugmentor, "augment_clip", lambda self, audio: audio)
+        random.seed(0)
+        out = sample_config.model_output_dir
+        for i in range(3):
+            _write_clip(out / "positive_train" / f"clip_{i:06d}.wav", 0.4, 0.2)
+            _write_clip(out / "negative_train" / f"clip_{i:06d}.wav", 0.5, 0.1)
+        sample_config.augmentation.rir_paths = []
+        sample_config.augmentation.background_paths = []
+        return sample_config
+
+    def test_rounds_start_from_originals(self, config: WakeWordConfig, monkeypatch):
+        # Each round adds one layer of "noise"; stacked rounds would add several
+        monkeypatch.setattr(
+            AudioAugmentor, "mix_with_background", lambda self, audio, **kw: audio + 0.01
+        )
+        config.augmentation.rounds = 3
+        run_augment(config)
+        ends = set()
+        for r in range(3):
+            out, _ = sf.read(
+                str(config.model_output_dir / "positive_train" / f"clip_000000_r{r}.wav")
+            )
+            assert out.max() == pytest.approx(0.21, abs=1e-3)
+            ends.add(int(np.flatnonzero(out > 0.1)[-1]))
+        assert len(ends) > 1  # fresh jitter per round
+
+    def test_context_speech_before_phrase(self, config: WakeWordConfig):
+        _write_clip(config.model_output_dir / "context_speech" / "clip_000000.wav", 3.0, 0.5)
+        config.augmentation.context_speech_probability = 1.0
+        config.augmentation.context_gap = (0.1, 0.1)
+        run_augment(config)
+        for split, seconds in (("positive_train", 0.4), ("negative_train", 0.5)):
+            out, _ = sf.read(str(config.model_output_dir / split / "clip_000000_r0.wav"))
+            runs = _runs(out != 0)
+            assert len(runs) == 2, split  # context, then the phrase
+            (_, ctx_end), (start, end) = runs
+            assert runs[0][0] == 0  # the 3 s context fills the padding from the start
+            assert start - ctx_end == 1600  # 100 ms gap
+            assert end - start == int(seconds * SR)
+
+    def test_near_miss_before_positives_only(self, config: WakeWordConfig):
+        config.augmentation.near_miss_context_probability = 1.0
+        config.augmentation.context_gap = (0.2, 0.2)
+        run_augment(config)
+        pos, _ = sf.read(str(config.model_output_dir / "positive_train" / "clip_000000_r0.wav"))
+        neg, _ = sf.read(str(config.model_output_dir / "negative_train" / "clip_000000_r0.wav"))
+        pos_runs = _runs(pos != 0)
+        assert len(pos_runs) == 2
+        assert pos_runs[1][0] - pos_runs[0][1] == 3200
+        assert pos_runs[0][1] - pos_runs[0][0] == int(0.5 * SR)  # the whole near-miss clip
+        assert len(_runs(neg != 0)) == 1
+
+    def test_split_phrase_with_pause(self, config: WakeWordConfig):
+        parts = config.model_output_dir / "positive_train_parts"
+        _write_clip(parts / "clip_000000.wav", 0.2, 0.3)
+        _write_clip(parts / "clip_000001.wav", 0.3, 0.4)
+        config.augmentation.split_phrase_probability = 1.0
+        config.augmentation.split_phrase_gap = (0.25, 0.25)
+        run_augment(config)
+        out, _ = sf.read(str(config.model_output_dir / "positive_train" / "clip_000001_r0.wav"))
+        runs = _runs(out != 0)
+        assert len(runs) == 2
+        (a0, a1), (b0, b1) = runs
+        assert (a1 - a0, b0 - a1, b1 - b0) == (int(0.2 * SR), 4000, int(0.3 * SR))
+        assert out[a0] == pytest.approx(0.3, abs=1e-3) and out[b0] == pytest.approx(0.4, abs=1e-3)
