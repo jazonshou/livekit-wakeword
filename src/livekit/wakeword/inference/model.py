@@ -61,7 +61,9 @@ class WakeWordModel:
             )
 
         self._mel_frontend = MelSpectrogramFrontend(onnx_path=mel_path, sess_options=sess_options)
-        self._speech_embedding = SpeechEmbedding(onnx_path=embedding_path, sess_options=sess_options)
+        self._speech_embedding = SpeechEmbedding(
+            onnx_path=embedding_path, sess_options=sess_options
+        )
 
         # name -> (onnx_session, input_name)
         self._classifiers: dict[str, tuple] = {}
@@ -70,7 +72,12 @@ class WakeWordModel:
             for model_path in models:
                 self.load_model(model_path, sess_options=sess_options)
 
-    def load_model(self, model_path: str | Path, model_name: str | None = None, sess_options: SessionOptions = None ) -> None:
+    def load_model(
+        self,
+        model_path: str | Path,
+        model_name: str | None = None,
+        sess_options: SessionOptions = None,
+    ) -> None:
         """Load a wake word classifier model.
 
         Args:
@@ -87,9 +94,7 @@ class WakeWordModel:
             model_name = model_path.stem
 
         session = ort.InferenceSession(
-            str(model_path),
-            providers=["CPUExecutionProvider"],
-            sess_options=sess_options
+            str(model_path), providers=["CPUExecutionProvider"], sess_options=sess_options
         )
         input_name = session.get_inputs()[0].name
         self._classifiers[model_name] = (session, input_name)
@@ -112,6 +117,20 @@ class WakeWordModel:
         if not self._classifiers:
             return {}
 
+        emb_sequence = self.embed(audio_chunk)
+        if emb_sequence is None:
+            return {name: 0.0 for name in self._classifiers}
+        return self._score_embeddings(emb_sequence)
+
+    def embed(self, audio_chunk: np.ndarray) -> np.ndarray | None:
+        """The ``(16, 96)`` speech embeddings the classifiers see for an audio chunk.
+
+        Args:
+            audio_chunk: ~2 s of 16 kHz audio, int16 or float32.
+
+        Returns:
+            The last 16 embeddings, or None if the chunk is too short to give 16.
+        """
         # Convert int16 to float32 if needed
         if audio_chunk.dtype == np.int16:
             audio_chunk = audio_chunk.astype(np.float32) / 32768.0
@@ -124,7 +143,7 @@ class WakeWordModel:
             all_mel = all_mel[0]
 
         if all_mel.shape[0] < EMBEDDING_WINDOW:
-            return {name: 0.0 for name in self._classifiers}
+            return None
 
         # Extract embeddings: 76-frame windows, stride 8
         embeddings = []
@@ -134,11 +153,10 @@ class WakeWordModel:
             embeddings.append(emb[0])
 
         if len(embeddings) < MIN_EMBEDDINGS:
-            return {name: 0.0 for name in self._classifiers}
+            return None
 
         # Use last 16 embeddings
-        emb_sequence = np.stack(embeddings[-MIN_EMBEDDINGS:], axis=0)
-        return self._score_embeddings(emb_sequence)
+        return np.stack(embeddings[-MIN_EMBEDDINGS:], axis=0)
 
     def _score_embeddings(self, emb_sequence: np.ndarray) -> dict[str, float]:
         """Run every loaded classifier on a ``(16, 96)`` embedding sequence."""

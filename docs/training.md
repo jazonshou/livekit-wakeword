@@ -180,6 +180,26 @@ Longer examples need longer clips: set `augmentation.clip_duration` to at least
 loading rejects a shorter clip. The ACAV100M negatives are contiguous, so they are cut into
 blocks of 16 + K steps.
 
+## Second-Stage Verifier
+
+**Source:** `src/livekit/wakeword/training/verifier.py`, CLI `livekit-wakeword train-verifier <config>`
+
+Trains the optional `WakeWordVerifier` that the listener runs only after the always-on model fires. It reuses the features `augment` already extracted, so it needs no new data:
+
+- **Classes** (`verifier.batch_n_per_class`): `positive` (128) against `adversarial_negative` near misses (256), plus a little `ACAV100M_sample` general speech (64) and optionally `background_noise` (0). Missing optional files are skipped.
+- **Model** (`verifier.model`): `conv_attention` `medium` by default; it runs once per trigger, so it can be larger than the always-on head.
+- **Training:** one phase of `verifier.steps` (20,000) with warmup, hold and cosine decay, focal loss, no mixup or negative weighting. Features with `max_pool_steps` context keep their last 16 steps.
+- **Threshold:** on the test splits, the highest threshold that keeps `verifier.target_recall` (0.98) of `positive_features_test` clips. Validation in the second half of training ranks checkpoints by the share of `negative_features_test` near misses rejected at that recall, and the best `verifier.n_average` (3) are averaged.
+- **Outputs** in the model directory: `<model_name>_verifier.pt`, `<model_name>_verifier.onnx` (threshold in its metadata) and `<model_name>_verifier_metrics.json`.
+
+```yaml
+verifier:
+  model: {model_type: conv_attention, model_size: medium}
+  steps: 20000
+  batch_n_per_class: {positive: 128, adversarial_negative: 256, ACAV100M_sample: 64}
+  target_recall: 0.98
+```
+
 ## Validation
 
 ### Data Sources

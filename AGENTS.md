@@ -31,6 +31,7 @@ uv run livekit-wakeword setup [--config YAML]   # Data deps; Piper if piper_vits
 uv run livekit-wakeword generate <config> # VITS TTS + SLERP speaker blending + adversarial negatives
 uv run livekit-wakeword augment <config>  # Augment + extract features → .npy
 uv run livekit-wakeword train <config>    # 3-phase adaptive training
+uv run livekit-wakeword train-verifier <config>  # Optional second-stage verifier (positives vs near misses)
 uv run livekit-wakeword export <config>   # Export classifier to ONNX
 uv run livekit-wakeword run <config>      # Full pipeline (generate→augment→extract→train→export)
 ```
@@ -61,12 +62,14 @@ Raw audio (16kHz) → MelSpectrogramFrontend (ONNX) → SpeechEmbedding (ONNX) �
   - `features.py` — Extract features through ONNX pipeline → .npy files
 - **`training/`**
   - `trainer.py` — `WakeWordTrainer` with 3-phase training (full → refinement → fine-tuning), hard example mining, adaptive negative weighting, checkpoint averaging
+  - `verifier.py` — `run_train_verifier`: positives vs near-miss training, threshold at `verifier.target_recall`, ONNX export
   - `metrics.py` — FPPH (false positives per hour), recall, balanced accuracy
 - **`export/onnx.py`** — Export classifier to ONNX with optional INT8 quantization
 - **`inference/`**
   - `model.py` — `WakeWordModel` class for simple prediction API
   - `streaming.py` — `StreamingWakeWordModel`: one new embedding per 80 ms hop, scores match `predict()` on the last 2 s
-  - `listener.py` — `WakeWordListener` class for async microphone detection
+  - `listener.py` — `WakeWordListener` class for async microphone detection; optional `verifier=` second stage
+  - `verifier.py` — `WakeWordVerifier`: second classifier run once on the trigger's cached embeddings (threshold from ONNX metadata)
 - **`swift/`** — `LiveKitWakeWord` Swift package: ONNX Runtime-based pipeline for iOS 16+ / macOS 14+. `WakeWordModel` (stateless predict) + `WakeWordListener` (actor around `AVAudioEngine`). The mel + embedding `.onnx` files from `src/livekit/wakeword/resources/` are bundled as package resources; classifier `.onnx` files are loaded from disk. ORT's CoreML Execution Provider (ANE/GPU/CPU) is used by default via `ExecutionProvider.coreML`. Depends on the [official ORT SPM package](https://github.com/microsoft/onnxruntime-swift-package-manager).
 - **`examples/ios_wakeword/`** — SwiftUI demo app (iOS + macOS) that consumes the `swift/` package via a local SPM dependency (`path: ../../swift`). `WakewordEngine` wraps `AVAudioEngine` + a 2 s Int16 ring buffer + background `WakeWordModel.predict()`; `ContentView` renders score/volume graphs and an execution-provider picker. Generated from `project.yml` via `xcodegen`.
 

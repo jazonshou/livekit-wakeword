@@ -166,6 +166,7 @@ WakeWordListener(
     threshold: float = 0.5,  # Detection threshold (0-1)
     debounce: float = 2.0,   # Minimum seconds between detections
     min_consecutive: int = 1 # 80 ms frames in a row a score must reach threshold to fire
+    verifier: WakeWordVerifier | Mapping[str, WakeWordVerifier] | None = None,  # off by default
 )
 ```
 
@@ -177,7 +178,29 @@ class Detection:
     name: str        # Model name that triggered
     confidence: float  # Score (0-1)
     timestamp: float   # Monotonic time
+    verifier_score: float | None = None  # Second-stage score, None without a verifier
 ```
+
+### Second-Stage Verifier
+
+`WakeWordVerifier` is an optional second classifier that confirms or rejects a trigger before it becomes a detection. The always-on model fires first; only then does the listener run the verifier, once, on the same `(16, 96)` embeddings the trigger was scored on (`StreamingWakeWordModel.embeddings()`, the last 2 s of audio). That is one classifier call and no feature extraction, so it costs nothing while idle and little per trigger, and the verifier can be a larger model trained only to separate the wake phrase from its near misses.
+
+```python
+from livekit.wakeword import WakeWordListener, WakeWordModel, WakeWordVerifier
+
+model = WakeWordModel(models=["hey_livekit.onnx"])
+verifier = WakeWordVerifier("hey_livekit_verifier.onnx")  # threshold read from the model
+
+async with WakeWordListener(model, threshold=0.5, verifier=verifier) as listener:
+    detection = await listener.wait_for_detection()
+    print(detection.confidence, detection.verifier_score)
+```
+
+- A single verifier checks every model's triggers; a `{model_name: verifier}` mapping checks only the models it names.
+- A rejected trigger doesn't fire, pause or start the debounce. The next hop that still meets the firing rule is checked again, so a phrase that is better aligned one hop later can still pass. `listener.rejected_triggers` counts rejections.
+- `WakeWordVerifier(path, threshold=None)` uses the threshold stored in the ONNX metadata (`verifier_threshold`) by `train-verifier`, or 0.5 if there is none. `score(embeddings)`, `score_batch(...)`, `verify(...)` and `score_audio(model, audio)` are available outside the listener.
+
+Train one with `livekit-wakeword train-verifier <config>` (see [Training](training.md#second-stage-verifier)) and measure it with `livekit-wakeword eval <config> --streaming --verifier <path>`, which writes `*_streaming_eval_verified.json` next to the baseline report.
 
 #### Lifecycle
 
