@@ -31,20 +31,58 @@ def _pad_or_truncate(
     return np.concatenate([pad, embeddings], axis=0)
 
 
+def _extract_files(
+    wav_files: list[Path],
+    mel_frontend: MelSpectrogramFrontend,
+    speech_embedding: SpeechEmbedding,
+    n_timesteps: int,
+) -> list[np.ndarray]:
+    import soundfile as sf
+
+    features = []
+    for wav_path in wav_files:
+        audio, _ = sf.read(str(wav_path))
+        if audio.ndim > 1:
+            audio = audio[:, 0]
+        embeddings = speech_embedding.extract_embeddings(mel_frontend(audio.astype(np.float32)))
+        features.append(_pad_or_truncate(embeddings[0], n_timesteps))
+    return features
+
+
+_worker_models: tuple[MelSpectrogramFrontend, SpeechEmbedding] | None = None
+
+
+def _extract_in_worker(wav_files: list[Path], n_timesteps: int) -> list[np.ndarray]:
+    """Process-pool task: single-threaded models, built once per worker."""
+    global _worker_models
+    if _worker_models is None:
+        import onnxruntime as ort
+
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = 1
+        _worker_models = (
+            MelSpectrogramFrontend(get_mel_model_path(), sess_options=options),
+            SpeechEmbedding(get_embedding_model_path(), sess_options=options),
+        )
+    return _extract_files(wav_files, *_worker_models, n_timesteps)
+
+
 def extract_features_from_directory(
     clip_dir: Path,
     mel_frontend: MelSpectrogramFrontend,
     speech_embedding: SpeechEmbedding,
     n_timesteps: int = N_EMBEDDING_TIMESTEPS,
+    workers: int = 1,
 ) -> np.ndarray:
     """Extract (N_clips, n_timesteps, 96) features from a directory of WAV files.
 
     Processes clips through MelSpectrogramFrontend → SpeechEmbedding,
-    then takes the last *n_timesteps* embedding timesteps per clip.
+    then takes the last *n_timesteps* embedding timesteps per clip. With
+    ``workers > 1`` clips are split across that many processes, each with its own
+    single-threaded models (the given ones are then unused).
     """
     import re
 
-    import soundfile as sf
     from tqdm import tqdm
 
     # Only process augmented clips (_rN.wav), skip clean TTS originals
@@ -54,26 +92,35 @@ def extract_features_from_directory(
         logger.warning(f"No WAV files in {clip_dir}")
         return np.zeros((0, n_timesteps, 96), dtype=np.float32)
 
+    chunks = [wav_files[i : i + 256] for i in range(0, len(wav_files), 256)]
     all_features: list[np.ndarray] = []
+    with tqdm(total=len(wav_files), desc=f"Features {clip_dir.name}", unit="clip") as pbar:
+        if workers <= 1:
+            for chunk in chunks:
+                all_features += _extract_files(chunk, mel_frontend, speech_embedding, n_timesteps)
+                pbar.update(len(chunk))
+        else:
+            import multiprocessing
+            from concurrent.futures import ProcessPoolExecutor
 
-    for wav_path in tqdm(wav_files, desc=f"Features {clip_dir.name}", unit="clip"):
-        audio, sr = sf.read(str(wav_path))
-        if audio.ndim > 1:
-            audio = audio[:, 0]
-        audio = audio.astype(np.float32)
-
-        mel = mel_frontend(audio)
-        embeddings = speech_embedding.extract_embeddings(mel)
-        all_features.append(_pad_or_truncate(embeddings[0], n_timesteps))
-
-    if not all_features:
-        return np.zeros((0, n_timesteps, 96), dtype=np.float32)
+            context = multiprocessing.get_context("spawn")
+            with ProcessPoolExecutor(workers, mp_context=context) as pool:
+                for features in pool.map(_extract_in_worker, chunks, [n_timesteps] * len(chunks)):
+                    all_features += features
+                    pbar.update(len(features))
 
     return np.stack(all_features, axis=0)  # (N_clips, n_timesteps, 96)
 
 
 def run_extraction(config: WakeWordConfig, sess_options: SessionOptions | None = None) -> None:
-    """Extract and save features for all splits of a wake word config."""
+    """Extract and save features for all splits of a wake word config.
+
+    Clips are spread over up to 16 processes (one ORT thread each), unless
+    *sess_options* is given, which keeps extraction in this process.
+    """
+    import os
+
+    workers = 1 if sess_options is not None else min(16, os.cpu_count() or 1)
     mel_frontend = MelSpectrogramFrontend(
         onnx_path=get_mel_model_path(),
         sess_options=sess_options,
@@ -105,6 +152,7 @@ def run_extraction(config: WakeWordConfig, sess_options: SessionOptions | None =
             mel_frontend=mel_frontend,
             speech_embedding=speech_embedding,
             n_timesteps=config.feature_steps,
+            workers=workers,
         )
 
         out_path = model_dir / feature_filename
