@@ -422,6 +422,12 @@ def eval(
         f"AUT={results['aut']:.4f}  FPPH={results['fpph']:.2f}  "
         f"Recall={results['recall']:.1%}  Threshold={results['threshold']:.2f}"
     )
+    if results["stream_fpph"] is not None:
+        logger.info(f"General speech only: FPPH={results['stream_fpph']:.2f}")
+    logger.info(
+        f"Best threshold for target_fp_per_hour: {results['optimal_threshold']:.3f}  "
+        f"Recall={results['optimal_recall']:.1%}  FPPH={results['optimal_fpph']:.2f}"
+    )
     logger.info(f"DET curve: {config.model_output_dir / f'{config.model_name}_det.png'}")
 
 

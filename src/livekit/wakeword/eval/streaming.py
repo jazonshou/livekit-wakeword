@@ -145,11 +145,16 @@ def make_scorer(model_path: str | Path, kind: str = "streaming") -> tuple[FrameS
     Returns:
         (scorer, kind actually used)
     """
+    import onnxruntime as ort
+
     from ..inference import model as inference_model
 
     if kind not in ("streaming", "window"):
         raise ValueError(f"Unknown scorer {kind!r}; expected 'streaming' or 'window'")
-    model = inference_model.WakeWordModel(models=[model_path])
+    # One hop is a tiny batch: extra ORT threads only add overhead, a lot on many-core hosts
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = 1
+    model = inference_model.WakeWordModel(models=[model_path], sess_options=options)
     if kind == "streaming":
         return StreamScorer(model), "streaming"
     return WindowScorer(model), "window"
