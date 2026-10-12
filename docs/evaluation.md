@@ -81,19 +81,25 @@ The DET curve is saved as `output/<model_name>/<model_name>_det.png` with an ann
 
 ### FPPH — False Positives Per Hour
 
-The number of false triggers per hour of negative audio. Computed as:
+The number of false triggers per hour of general speech:
 
 ```
-FPPH = (clip_false_accepts + stream_false_accepts) / (clip_hours + stream_hours)
+FPPH = stream_false_accepts / stream_hours
 ```
 
-- `clip_false_accepts = count(negative_clip_scores >= threshold)`, one decision per test clip,
-  and `clip_hours = n_negative_clips × clip_duration / 3600`.
 - The ~11 h validation stream is scored the way a live detector sees it: one 16-step window
-  per 80 ms hop (stride 1), so every hop can fire. Consecutive hops above the threshold count as
-  one false accept, and hops within `streaming_eval.debounce_seconds` (default 2 s) of a false
-  accept are ignored, as in `WakeWordListener`. `stream_hours = n_hops × 0.08 / 3600`, and the
-  stream-only rate is reported as `stream_fpph`.
+  per 80 ms hop (stride 1), so every hop can fire.
+- Consecutive hops above the threshold count as one false accept, and hops within
+  `streaming_eval.debounce_seconds` (default 2 s) of a false accept are ignored, as in
+  `WakeWordListener`.
+- `stream_hours = n_hops × 0.08 / 3600`.
+
+The negative test clips (near-miss phrases, plus some background noise) are not counted per
+hour, since back-to-back near misses are not an hour of real audio. They are reported as
+`near_miss_rate`, the share of those clips that fire.
+
+Without the validation stream, FPPH falls back to the test clips:
+`count(negative_clip_scores >= threshold) / (n_negative_clips × clip_duration / 3600)`.
 
 Training validation (`_validate`, `_find_optimal_threshold`) uses the same computation.
 
@@ -188,7 +194,7 @@ Each set is one stream and is reported separately. By default:
 |-----|------------|----------|
 | `positive_silence` | `positive_test` clips, silence between them | miss rate |
 | `positive_speech` | `positive_test` clips, each preceded by a speech clip ending 0-400 ms before it | miss rate, false accepts on the preceding speech |
-| `near_miss` | `negative_test` clips (adversarial phrases) | share of clips that fired, false accepts per hour |
+| `near_miss` | `negative_test` clips (adversarial phrases) | share of clips that fired |
 | `validation_stream` | `validation_set_features.npy`, every hop | false accepts per hour |
 
 A positive clip counts as detected if the detector fires between its start and
@@ -203,7 +209,7 @@ streaming_eval:
   max_clips_per_set: 1000
   sets:
     - {name: positive_pause, positive: true, paths: [./eval/positive_pause]}
-    - {name: other_speech, positive: false, paths: [./eval/hey_other_word]}
+    - {name: other_speech, positive: false, paths: [./eval/hey_other_word], near_miss: true}
     - {name: household, positive: false, paths: [./eval/household.wav]}
   # Optional noise bed under every stream, e.g. DEMAND at 10 dB SNR
   background_paths: [./data/demand]
@@ -237,10 +243,17 @@ preferred when present, so augmented copies are skipped).
 
 ### Threshold selection
 
-A DET curve (pooled miss rate over positive sets vs pooled false accepts per hour over
-negative sets) is computed for thresholds 0.01-0.99. The selected threshold has the lowest miss
-rate with at most `target_fa_per_hour` false accepts per hour; if none qualifies, the threshold
-with the fewest false accepts is reported with `target_met: false`.
+A DET curve is computed for thresholds 0.01-0.99:
+
+- miss rate, pooled over the positive sets;
+- false accepts per hour, pooled over the negative sets except near misses;
+- `near_miss_rate`, the share of near-miss clips that fired (sets with `near_miss: true`,
+  including the default `near_miss` set).
+
+The selected threshold has the lowest miss rate with at most `target_fa_per_hour` false
+accepts per hour; if none qualifies, the threshold with the fewest false accepts is reported
+with `target_met: false`. Near misses don't move the selected threshold: check their rate in the
+report, and pick a higher threshold with `-t` if it's too high.
 
 ### Output files
 

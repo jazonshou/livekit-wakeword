@@ -75,12 +75,13 @@ learning_rate: 0.0001
 weight_decay: 0.01
 label_smoothing: 0.05
 max_negative_weight: 3000
-# Validation now counts false accepts on every 80 ms hop of the stream
+# False wakes per hour on general speech; near misses are reported as a rate
 target_fp_per_hour: 0.5
 
+# Near misses are one sound away from "hey zuck"; more per batch lowers recall
 batch_n_per_class:
   positive: 50
-  adversarial_negative: 200
+  adversarial_negative: 50
   ACAV100M_sample: 1024
   background_noise: 50
 

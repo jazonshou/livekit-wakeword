@@ -72,12 +72,12 @@ class TestStreamMetrics:
         stream[1000:1010] = 0.9  # one event spanning 10 hops
         stream[5000] = 0.9
         m = evaluate_model(pos, neg, 0.5, validation_hours=1.0, stream_preds=stream)
-        assert m["stream_fpph"] == pytest.approx(2.0)
-        assert m["fpph"] == pytest.approx(3.0 / 2.0)
+        assert m["fpph"] == pytest.approx(2.0)
+        assert m["near_miss_rate"] == pytest.approx(0.5)
 
     def test_without_stream_unchanged(self) -> None:
         m = evaluate_model(np.array([0.9]), np.array([0.6]), 0.5, validation_hours=1.0)
-        assert m["fpph"] == 1.0 and "stream_fpph" not in m
+        assert m["fpph"] == 1.0 and "near_miss_rate" not in m
 
     def test_find_best_threshold_uses_stream(self) -> None:
         pos = np.full(10, 0.95)
@@ -185,6 +185,19 @@ class TestStreams:
         assert chosen["miss_rate"] == 0.0 and chosen["fa_per_hour"] == 0.0
         assert 0.6 < chosen["threshold"] <= 0.9
 
+    def test_near_misses_are_a_rate_not_per_hour(self) -> None:
+        pos = build_stream("p", [_clip(1.0)], positive=True, gap_seconds=3.0)
+        near = build_stream("n", [_clip(1.0)] * 2, positive=False, gap_seconds=3.0)
+        near.near_miss = True
+        pos_scores = np.zeros(int(np.ceil(pos.audio.shape[0] / FRAME_SAMPLES)))
+        pos_scores[pos.targets[0][0] // FRAME_SAMPLES + 3] = 0.9
+        near_scores = np.zeros(int(np.ceil(near.audio.shape[0] / FRAME_SAMPLES)))
+        near_scores[near.targets[0][0] // FRAME_SAMPLES + 3] = 0.6
+        assert "fa_per_hour" not in summarize_stream(near, near_scores, 0.5, debounce_hops=25)
+        points = det_curve([(pos, pos_scores), (near, near_scores)], debounce_hops=25)
+        assert all(p["fa_per_hour"] == 0.0 for p in points)
+        assert points[49]["threshold"] == 0.5 and points[49]["near_miss_rate"] == 0.5
+
 
 class TestWindowScorer:
     def test_waits_for_full_window(self) -> None:
@@ -263,7 +276,7 @@ def test_trainer_validation_counts_every_hop(sample_config: WakeWordConfig) -> N
     trainer = WakeWordTrainer(sample_config)
     trainer._predict = lambda x, batch_size=512: x.max(axis=(1, 2))  # type: ignore[method-assign]
     metrics = trainer._validate()
-    assert metrics["stream_fpph"] == pytest.approx(2.0)
+    assert metrics["fpph"] == pytest.approx(2.0)
     assert metrics["recall"] == 1.0
 
 

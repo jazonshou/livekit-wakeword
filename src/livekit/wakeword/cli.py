@@ -422,8 +422,8 @@ def eval(
         f"AUT={results['aut']:.4f}  FPPH={results['fpph']:.2f}  "
         f"Recall={results['recall']:.1%}  Threshold={results['threshold']:.2f}"
     )
-    if results["stream_fpph"] is not None:
-        logger.info(f"General speech only: FPPH={results['stream_fpph']:.2f}")
+    if results["near_miss_rate"] is not None:
+        logger.info(f"Near misses fired: {results['near_miss_rate']:.1%}")
     logger.info(
         f"Best threshold for target_fp_per_hour: {results['optimal_threshold']:.3f}  "
         f"Recall={results['optimal_recall']:.1%}  FPPH={results['optimal_fpph']:.2f}"
@@ -437,11 +437,12 @@ def _print_streaming_report(report: dict[str, Any]) -> None:
 
     sel = report["selected"]
     met = "" if report["target_met"] else " (target not met)"
+    near = f", near misses fired {sel['near_miss_rate']:.1%}" if "near_miss_rate" in sel else ""
     table = Table(
         title=(
             f"{report['model']} — {report['scorer']} scorer, threshold "
             f"{report['report_threshold']:.2f} (selected {sel['threshold']:.2f}: miss "
-            f"{sel['miss_rate']:.1%} at {sel['fa_per_hour']:.2f} FA/h{met})"
+            f"{sel['miss_rate']:.1%} at {sel['fa_per_hour']:.2f} FA/h{near}{met})"
         )
     )
     for col in ("Set", "Clips", "Hours", "Miss rate", "Fired on clips", "False accepts", "FA/h"):
@@ -454,7 +455,7 @@ def _print_streaming_report(report: dict[str, Any]) -> None:
             f"{s['miss_rate']:.1%}" if s["positive"] else "",
             "" if s["positive"] else f"{s['fa_per_clip']:.1%}",
             str(s["false_accepts"]),
-            "" if s["positive"] else f"{s['fa_per_hour']:.2f}",
+            f"{s['fa_per_hour']:.2f}" if "fa_per_hour" in s else "",
         )
     Console().print(table)
 

@@ -12,12 +12,14 @@ Each set is reported separately:
   start and ``detection_window_seconds`` after its end) and false accepts elsewhere in
   the stream (e.g. on the speech placed before each clip);
 - negative sets: share of clips that fired, and false accepts per hour of audio;
+- near-miss sets (``near_miss: true``, such as the default ``near_miss`` set): share of
+  clips that fired only, since back-to-back near misses are not an hour of real audio;
 - ``validation_stream``: false accepts per hour on the ~11 h validation features,
   scored at every hop.
 
-A DET curve (pooled miss rate vs pooled false accepts per hour) is computed over
-thresholds, and the threshold with the lowest miss rate at no more than
-``target_fa_per_hour`` is selected.
+A DET curve (pooled miss rate vs false accepts per hour pooled over the negative sets
+that are not near misses) is computed over thresholds, and the threshold with the
+lowest miss rate at no more than ``target_fa_per_hour`` is selected.
 """
 
 from __future__ import annotations
@@ -169,6 +171,7 @@ class EvalStream:
     audio: np.ndarray  # float32, 16 kHz
     targets: list[tuple[int, int]] = field(default_factory=list)  # clip [start, end) samples
     audio_seconds: float = 0.0  # seconds of clip audio, excluding inserted silence
+    near_miss: bool = False  # reported per clip, not per hour
 
 
 def _collect_wavs(paths: Sequence[str | Path], originals_only: bool = False) -> list[Path]:
@@ -332,12 +335,10 @@ def summarize_stream(
             "false_accepts": outside,
         }
     total = int(fires.shape[0])
-    return {
-        "clips": n,
-        "fa_per_clip": float(fired.mean()) if n else 0.0,
-        "false_accepts": total,
-        "fa_per_hour": total / hours if hours > 0 else 0.0,
-    }
+    out = {"clips": n, "fa_per_clip": float(fired.mean()) if n else 0.0, "false_accepts": total}
+    if not stream.near_miss:
+        out["fa_per_hour"] = total / hours if hours > 0 else 0.0
+    return out
 
 
 def det_curve(
@@ -348,11 +349,15 @@ def det_curve(
     detection_window_seconds: float = 1.0,
     thresholds: np.ndarray = THRESHOLDS,
 ) -> list[dict[str, float]]:
-    """Pooled miss rate and false accepts per hour at each threshold."""
+    """Pooled miss rate and false accepts per hour at each threshold.
+
+    Near-miss sets add ``near_miss_rate`` (share of their clips that fired) instead of
+    false accepts per hour.
+    """
     points: list[dict[str, float]] = []
     for t in thresholds:
-        misses = clips = false_accepts = 0
-        hours = 0.0
+        misses = clips = false_accepts = near_clips = 0
+        hours = near_fired = 0.0
         for stream, scores in streams:
             s = summarize_stream(
                 stream,
@@ -365,16 +370,20 @@ def det_curve(
             if stream.positive:
                 clips += int(s["clips"])
                 misses += int(s["misses"])
+            elif stream.near_miss:
+                near_clips += int(s["clips"])
+                near_fired += s["fa_per_clip"] * s["clips"]
             else:
                 false_accepts += int(s["false_accepts"])
                 hours += stream.audio_seconds / 3600.0
-        points.append(
-            {
-                "threshold": float(t),
-                "miss_rate": misses / clips if clips else 0.0,
-                "fa_per_hour": false_accepts / hours if hours > 0 else 0.0,
-            }
-        )
+        point = {
+            "threshold": float(t),
+            "miss_rate": misses / clips if clips else 0.0,
+            "fa_per_hour": false_accepts / hours if hours > 0 else 0.0,
+        }
+        if near_clips:
+            point["near_miss_rate"] = near_fired / near_clips
+        points.append(point)
     return points
 
 
@@ -403,7 +412,7 @@ def _default_sets(config: WakeWordConfig) -> list[StreamingEvalSet]:
         )
     if (model_dir / "negative_test").is_dir():
         neg = [str(model_dir / "negative_test")]
-        sets.append(StreamingEvalSet(name="near_miss", positive=False, paths=neg))
+        sets.append(StreamingEvalSet(name="near_miss", positive=False, paths=neg, near_miss=True))
     return sets
 
 
@@ -573,6 +582,7 @@ def run_streaming_eval(
             background=background,
             snr_db=cfg.snr_db,
         )
+        stream.near_miss = spec.near_miss
         logger.info(
             "Scoring %s: %d clips, %.1f min of audio",
             spec.name,

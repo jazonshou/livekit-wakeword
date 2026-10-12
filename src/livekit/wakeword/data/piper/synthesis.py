@@ -254,32 +254,14 @@ def generate_samples(
                 batch_texts = [next(texts_iter) for _ in range(current_batch_size)]
 
                 phoneme_ids = [get_phonemes(config, t, voice) for t in batch_texts]
-                phoneme_lengths = [len(ids) for ids in phoneme_ids]
-                phoneme_ids = _right_pad_lists(phoneme_ids)
-
-                speaker_1 = _to_device(torch.LongTensor([s[0] for s in speakers_batch]), device)
-                speaker_2 = _to_device(torch.LongTensor([s[1] for s in speakers_batch]), device)
-
-                audio = _generate_audio(
-                    vits_model,
-                    speaker_1,
-                    speaker_2,
-                    phoneme_ids,
-                    phoneme_lengths,
-                    sw,
-                    ns,
-                    nsw,
-                    ls,
-                    device,
+                clips = _synthesize_batch(
+                    vits_model, resampler, speakers_batch, phoneme_ids, (sw, ls, ns, nsw), device
                 )
 
-                audio_16k = resampler(audio.cpu()).numpy()
-                audio_int16 = audio_float_to_int16(audio_16k)
-
-                for audio_idx in range(audio_int16.shape[0]):
+                for clip in clips:
                     if sample_idx >= max_samples:
                         break
-                    trimmed = remove_silence(audio_int16[audio_idx].flatten())
+                    trimmed = remove_silence(clip)
                     wav_path = output_path / f"clip_{sample_idx:06d}.wav"
                     with wave.open(str(wav_path), "wb") as wav_file:
                         wav_file.setframerate(16000)
@@ -337,6 +319,46 @@ def _right_pad_lists(lists: list[list[int]]) -> list[list[int]]:
     """Right-pad phoneme ID lists to equal length (pad token = 1 / '^')."""
     max_length = max(len(lst) for lst in lists)
     return [lst + [1] * (max_length - len(lst)) for lst in lists]
+
+
+def _synthesize_batch(
+    model: Any,
+    resampler: Any,
+    speakers: list[tuple[int, int]],
+    phoneme_ids: list[list[int]],
+    settings: tuple[float, float, float, float],
+    device: torch.device,
+) -> list[np.ndarray]:
+    """16 kHz int16 audio per clip. On CUDA out-of-memory (a shared GPU filling up),
+    the batch is split in half and retried, down to single clips."""
+    sw, ls, ns, nsw = settings
+    try:
+        audio = _generate_audio(
+            model,
+            _to_device(torch.LongTensor([s[0] for s in speakers]), device),
+            _to_device(torch.LongTensor([s[1] for s in speakers]), device),
+            _right_pad_lists(phoneme_ids),
+            [len(ids) for ids in phoneme_ids],
+            sw,
+            ns,
+            nsw,
+            ls,
+            device,
+        )
+    except torch.cuda.OutOfMemoryError:
+        if len(phoneme_ids) == 1:
+            raise
+        audio = None
+    if audio is None:  # retry outside the except block, so the failed tensors are freed
+        torch.cuda.empty_cache()
+        half = len(phoneme_ids) // 2
+        return _synthesize_batch(
+            model, resampler, speakers[:half], phoneme_ids[:half], settings, device
+        ) + _synthesize_batch(
+            model, resampler, speakers[half:], phoneme_ids[half:], settings, device
+        )
+    audio_int16 = audio_float_to_int16(resampler(audio.cpu()).numpy())
+    return [clip.flatten() for clip in audio_int16]
 
 
 def _generate_audio(

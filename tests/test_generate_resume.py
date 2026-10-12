@@ -58,3 +58,25 @@ class TestSynthesizeClipsNoModel:
                 n_samples=5,
                 vits_model_path=tmp_path / "nonexistent.pt",
             )
+
+
+def test_tts_batch_split_on_cuda_oom(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A batch that runs out of GPU memory is retried in halves, keeping every clip."""
+    import torch
+
+    from livekit.wakeword.data.piper import synthesis
+
+    calls: list[int] = []
+
+    def fake_generate(model, s1, s2, ids, lengths, *args):  # type: ignore[no-untyped-def]
+        calls.append(len(ids))
+        if len(ids) > 2:
+            raise torch.cuda.OutOfMemoryError("full")
+        return torch.full((len(ids), 1, 2205), 0.1)
+
+    monkeypatch.setattr(synthesis, "_generate_audio", fake_generate)
+    clips = synthesis._synthesize_batch(
+        None, lambda a: a, [(0, 1)] * 5, [[1, 2]] * 5, (0.5, 1.0, 0.7, 0.8), torch.device("cpu")
+    )
+    assert len(clips) == 5
+    assert calls == [5, 2, 3, 1, 2]

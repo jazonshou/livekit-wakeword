@@ -154,13 +154,15 @@ def evaluate_model(
         threshold: Detection threshold.
         validation_hours: Hours of audio covered by ``negative_preds``.
         stream_preds: Optional per-hop scores of a continuous negative stream
-            (one per 80 ms hop, see :func:`stride1_windows`). Its false accepts
-            are counted with :func:`streaming_false_accepts` and its duration is
-            added to ``validation_hours``.
+            (one per 80 ms hop, see :func:`stride1_windows`). When given, ``fpph``
+            counts only its false accepts (:func:`streaming_false_accepts`). The
+            negative clips are then reported as ``near_miss_rate``, the share that
+            fire: they are mostly near-miss phrases, and back-to-back near misses
+            are not an hour of real audio.
         debounce_hops: Debounce used when counting stream false accepts.
         min_consecutive: Consecutive hops needed to fire on the stream.
 
-    Returns dict with keys: fpph, recall, accuracy, threshold, and stream_fpph
+    Returns dict with keys: fpph, recall, accuracy, threshold, and near_miss_rate
     when ``stream_preds`` is given.
     """
     if stream_preds is None or len(stream_preds) == 0:
@@ -173,14 +175,14 @@ def evaluate_model(
 
     stream_hours = len(stream_preds) * HOP_SECONDS / 3600.0
     stream_fp = streaming_false_accepts(stream_preds, threshold, debounce_hops, min_consecutive)
-    clip_fp = int(np.sum(negative_preds >= threshold))
-    total_hours = validation_hours + stream_hours
     all_negative = (
         np.concatenate([negative_preds, stream_preds]) if len(negative_preds) else stream_preds
     )
     return {
-        "fpph": float((clip_fp + stream_fp) / total_hours),
-        "stream_fpph": float(stream_fp / stream_hours),
+        "fpph": float(stream_fp / stream_hours),
+        "near_miss_rate": float(np.mean(negative_preds >= threshold))
+        if len(negative_preds)
+        else 0.0,
         "recall": recall_at_threshold(positive_preds, threshold),
         "accuracy": accuracy(positive_preds, all_negative, threshold),
         "threshold": threshold,
