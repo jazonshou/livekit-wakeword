@@ -186,6 +186,9 @@ class StreamingEvalSet(BaseModel):
     paths: list[str]
     # Precede each clip with a speech clip that ends 0-400 ms before it
     speech_before: bool = False
+    # Near-miss phrases: reported as the share of clips that fire, and kept out of the
+    # false accepts per hour used to pick the threshold
+    near_miss: bool = False
 
 
 class StreamingEvalConfig(BaseModel):

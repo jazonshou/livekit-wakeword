@@ -224,8 +224,8 @@ def run_eval(config: WakeWordConfig, model_path: str | Path) -> dict[str, float]
     results = {
         "aut": aut,
         "fpph": fixed["fpph"],
-        # False accepts per hour on the general-speech stream alone (no near-miss clips)
-        "stream_fpph": fixed.get("stream_fpph"),
+        # Share of negative test clips (mostly near misses) that fire; None without the stream
+        "near_miss_rate": fixed.get("near_miss_rate"),
         "recall": fixed["recall"],
         "accuracy": fixed["accuracy"],
         "threshold": fixed["threshold"],

@@ -162,6 +162,12 @@ between the wake word and its near-misses.
 (default 50, against 1024 ACAV100M clips). Raising it, for example to 200, puts more of the
 loss on phrases that sound like the wake word.
 
+- Near misses one sound away ("hey duck" for "hey zuck") can be hard to tell apart in the
+  speech embeddings.
+- Each one weighs up to `max_negative_weight` times a positive, so too many of them teach the
+  model to score real wake words low.
+- If recall is low, lower it back toward 50.
+
 ## Max-Pooling Streaming Loss
 
 A live listener scores the stream every 80 ms, so the phrase can sit anywhere near the end of
@@ -228,11 +234,12 @@ If the external validation set has a sample count not divisible by 16 (required 
 
 | Metric | Function | Description |
 |--------|----------|-------------|
-| FPPH | `false_positives_per_hour()` | Count of predictions >= threshold on negatives, divided by total hours |
+| FPPH | `streaming_false_accepts()` | False accepts per hour on the validation stream (general speech) |
+| Near-miss rate | `evaluate_model()` | Share of negative test clips (mostly near misses) that fire |
 | Recall | `recall_at_threshold()` | True positive rate: `mean(positive_preds >= threshold)` |
 | Balanced Accuracy | `accuracy()` | `(TPR + TNR) / 2` at the given threshold |
 
-The `evaluate_model()` function computes all metrics at once. Validation hours are computed from the actual negative clip count × clip duration (default 2.0s), not a hardcoded value. This ensures FPPH is accurate regardless of whether the external ACAV100M validation set is present.
+The `evaluate_model()` function computes all metrics at once. Near misses are a rate, not a per-hour count, so they don't trigger the negative weight doubling. Without the ACAV100M validation stream, FPPH falls back to negative test clips per hour (clip count × `clip_duration`). See [evaluation.md](evaluation.md#fpph--false-positives-per-hour).
 
 ### Validation Schedule
 

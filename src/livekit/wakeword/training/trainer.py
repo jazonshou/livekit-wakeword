@@ -158,7 +158,9 @@ class WakeWordTrainer:
             v = self._validation_data
             logger.info(
                 "Validation: %d positive clips, %d negative clips, %.1f h negative stream",
-                v.positive.shape[0], v.negative_clips.shape[0], v.stream_hours,
+                v.positive.shape[0],
+                v.negative_clips.shape[0],
+                v.stream_hours,
             )
         return self._validation_data
 
@@ -354,7 +356,8 @@ class WakeWordTrainer:
                 pbar.write(
                     f"  Validation @ step {step}: "
                     f"FPPH={metrics['fpph']:.2f}, "
-                    f"Recall={metrics['recall']:.3f}, Acc={metrics['accuracy']:.3f}"
+                    f"Recall={metrics['recall']:.3f}, "
+                    f"Near-miss fired={metrics.get('near_miss_rate', 0.0):.1%}"
                 )
                 self._log_metrics(step, phase, metrics)
                 self._save_checkpoint(step, phase, metrics)
@@ -423,7 +426,8 @@ class WakeWordTrainer:
         self._log_metrics(total_steps, 0, {**optimal, "note": "optimal_threshold"})  # type: ignore[arg-type]
         logger.info(
             f"Optimal threshold: {optimal['threshold']:.2f} "
-            f"(FPPH={optimal['fpph']:.2f}, Recall={optimal['recall']:.3f})"
+            f"(FPPH={optimal['fpph']:.2f}, Recall={optimal['recall']:.3f}, "
+            f"Near-miss fired={optimal.get('near_miss_rate', 0.0):.1%})"
         )
         logger.info(f"Metrics saved to {self._metrics_path}")
 
